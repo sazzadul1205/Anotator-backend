@@ -16,9 +16,19 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^9.9.5"
+    "mongoose": "^9.9.5",
+    "multer": "^2.3.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sazzadul1205/Anotator-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sazzadul1205/Anotator-backend/issues"
+  },
+  "homepage": "https://github.com/sazzadul1205/Anotator-backend#readme"
 }

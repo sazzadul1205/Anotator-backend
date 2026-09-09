@@ -13,7 +13,12 @@ connectDB();
 
 // Routes
 const authRoutes = require("./routes/authRoutes");
+const projectRoutes = require("./routes/projectRoutes");
+const commentRoutes = require("./routes/commentRoutes");
+
 app.use("/api/auth", authRoutes);
+app.use("/api", projectRoutes);
+app.use("/api", commentRoutes);
 
 app.get("/", (req, res) => {
     res.json({
@@ -24,5 +29,5 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:5000`);
+    console.log(`Server running on http://localhost:${PORT}`);
 });
