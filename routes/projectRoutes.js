@@ -1,14 +1,20 @@
 const express = require("express");
 const router = express.Router();
+
 const { getDB } = require("../config/db");
+
 const { ObjectId } = require("mongodb");
-const multer = require("multer");
-const path = require("path");
+
+// File upload
 const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
+
+// Middleware
 const { authenticate, logRequest } = require("../middleware");
 const { parseFileForComments } = require("../services/fileParser");
 
-// ==================== MULTER CONFIG ====================
+// Multer configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = path.join(__dirname, "../uploads");
@@ -23,11 +29,12 @@ const storage = multer.diskStorage({
   },
 });
 
-const fileFilter = (req, file, cb) => {
+// File filter
+const fileFilter = ( file, cb) => {
   const allowedTypes = [
     "text/csv",
     "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.spreadsheet.sheet",
   ];
   if (allowedTypes.includes(file.mimetype)) {
     cb(null, true);
@@ -36,18 +43,19 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
+// Multer
 const upload = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter,
 });
 
-// ==================== ROUTES ====================
-
 // CREATE PROJECT
 router.post("/projects", authenticate, logRequest, async (req, res) => {
   try {
+    // console.log("Creating project by:", req.user.username);
     if (req.user.role !== "Admin") {
+      // console.log("Non-admin tried to create project:", req.user.username);
       return res.status(403).json({ success: false, error: "Admin only" });
     }
 
@@ -61,12 +69,14 @@ router.post("/projects", authenticate, logRequest, async (req, res) => {
         .json({ success: false, error: "Project name and assignedTo are required" });
     }
 
+    // console.log("Verifying assigned user:", assignedTo);
     const assignedUser = await db.collection("Users").findOne({
       _id: new ObjectId(assignedTo),
       role: { $in: ["Annotator", "Viewer"] },
     });
 
     if (!assignedUser) {
+      // console.log("Invalid assigned user:", assignedTo);
       return res
         .status(400)
         .json({ success: false, error: "Assigned user is not an annotator or viewer" });
@@ -88,6 +98,7 @@ router.post("/projects", authenticate, logRequest, async (req, res) => {
     };
 
     const result = await ProjectsCollection.insertOne(newProject);
+    // console.log("Project created:", name, "ID:", result.insertedId);
 
     res.status(201).json({
       success: true,
@@ -95,7 +106,7 @@ router.post("/projects", authenticate, logRequest, async (req, res) => {
       data: { ...newProject, _id: result.insertedId },
     });
   } catch (err) {
-    console.error("Create project error:", err);
+    // console.error("Create project error:", err);
     res.status(500).json({ success: false, error: "Failed to create project" });
   }
 });
@@ -103,25 +114,28 @@ router.post("/projects", authenticate, logRequest, async (req, res) => {
 // GET ALL PROJECTS
 router.get("/projects", authenticate, logRequest, async (req, res) => {
   try {
+    // console.log("Fetching projects for user:", req.user.username);
     const db = getDB();
     const ProjectsCollection = db.collection("Projects");
     let query = {};
 
     if (req.user.role !== "Admin") {
       query.assignedTo = new ObjectId(req.user.userId);
+      // console.log("Filtering for assigned user:", req.user.userId);
     }
 
     const projects = await ProjectsCollection.find(query)
       .sort({ createdAt: -1 })
       .toArray();
 
+    // console.log("Found", projects.length, "projects");
     res.status(200).json({
       success: true,
       count: projects.length,
       data: projects,
     });
   } catch (err) {
-    console.error("Get projects error:", err);
+    // console.error("Get projects error:", err);
     res.status(500).json({ success: false, error: "Failed to fetch projects" });
   }
 });
@@ -129,6 +143,7 @@ router.get("/projects", authenticate, logRequest, async (req, res) => {
 // GET SINGLE PROJECT
 router.get("/projects/:projectId", authenticate, logRequest, async (req, res) => {
   try {
+    // console.log("Fetching project:", req.params.projectId);
     const db = getDB();
     const ProjectsCollection = db.collection("Projects");
     const { projectId } = req.params;
@@ -139,6 +154,7 @@ router.get("/projects/:projectId", authenticate, logRequest, async (req, res) =>
 
     const project = await ProjectsCollection.findOne({ _id: new ObjectId(projectId) });
     if (!project) {
+      // console.log("Project not found:", projectId);
       return res.status(404).json({ success: false, error: "Project not found" });
     }
 
@@ -146,6 +162,7 @@ router.get("/projects/:projectId", authenticate, logRequest, async (req, res) =>
       req.user.role !== "Admin" &&
       project.assignedTo.toString() !== req.user.userId.toString()
     ) {
+      // console.log("Access denied for user:", req.user.username);
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
@@ -154,7 +171,7 @@ router.get("/projects/:projectId", authenticate, logRequest, async (req, res) =>
       data: project,
     });
   } catch (err) {
-    console.error("Get project error:", err);
+    // console.error("Get project error:", err);
     res.status(500).json({ success: false, error: "Failed to fetch project" });
   }
 });
@@ -162,7 +179,9 @@ router.get("/projects/:projectId", authenticate, logRequest, async (req, res) =>
 // DELETE PROJECT (Hard delete)
 router.delete("/projects/:projectId", authenticate, logRequest, async (req, res) => {
   try {
+    // console.log("Deleting project:", req.params.projectId);
     if (req.user.role !== "Admin") {
+      // console.log("Non-admin tried to delete project:", req.user.username);
       return res.status(403).json({ success: false, error: "Admin only" });
     }
 
@@ -177,9 +196,11 @@ router.delete("/projects/:projectId", authenticate, logRequest, async (req, res)
 
     const project = await ProjectsCollection.findOne({ _id: new ObjectId(projectId) });
     if (!project) {
+      // console.log("Project not found:", projectId);
       return res.status(404).json({ success: false, error: "Project not found" });
     }
 
+    // console.log("Deleting associated comments");
     const commentsResult = await CommentsCollection.deleteMany({
       projectId: new ObjectId(projectId),
     });
@@ -190,6 +211,7 @@ router.delete("/projects/:projectId", authenticate, logRequest, async (req, res)
       return res.status(404).json({ success: false, error: "Project not found during deletion" });
     }
 
+    // console.log("Project and", commentsResult.deletedCount, "comments deleted");
     res.status(200).json({
       success: true,
       message: `Project and ${commentsResult.deletedCount} comments permanently deleted`,
@@ -199,7 +221,7 @@ router.delete("/projects/:projectId", authenticate, logRequest, async (req, res)
       },
     });
   } catch (err) {
-    console.error("Delete project error:", err);
+    // console.error("Delete project error:", err);
     res.status(500).json({ success: false, error: "Failed to delete project" });
   }
 });
@@ -212,6 +234,7 @@ router.post(
   upload.single("file"),
   async (req, res) => {
     try {
+      // console.log("Uploading file to project:", req.params.projectId);
       const db = getDB();
       const ProjectsCollection = db.collection("Projects");
       const CommentsCollection = db.collection("Comments");
@@ -223,11 +246,13 @@ router.post(
 
       const project = await ProjectsCollection.findOne({ _id: new ObjectId(projectId) });
       if (!project) {
+        // console.log("Project not found:", projectId);
         return res.status(404).json({ success: false, error: "Project not found" });
       }
 
       // 🔒 PREVENT DUPLICATE UPLOAD
       if (project.fileInfo) {
+        // console.log("Duplicate upload attempt for project:", projectId);
         return res.status(400).json({
           success: false,
           error: "A file has already been uploaded to this project. Duplicate uploads are not allowed.",
@@ -235,6 +260,7 @@ router.post(
       }
 
       if (req.user.role !== "Admin" && project.assignedTo.toString() !== req.user.userId.toString()) {
+        // console.log("Access denied for upload:", req.user.username);
         return res.status(403).json({ success: false, error: "Access denied" });
       }
 
@@ -242,10 +268,13 @@ router.post(
         return res.status(400).json({ success: false, error: "No file uploaded" });
       }
 
+      // console.log("File received:", req.file.originalname, "size:", req.file.size);
+
       const filePath = req.file.path;
       let parsedComments = [];
 
       try {
+        // console.log("Parsing file...");
         const parsed = parseFileForComments(filePath);
         parsedComments = parsed.map((item) => ({
           externalId: item.externalId,
@@ -260,7 +289,9 @@ router.post(
           createdAt: new Date(),
           updatedAt: new Date(),
         }));
+        // console.log("Parsed", parsedComments.length, "comments");
       } catch (parseError) {
+        // console.log("Parse error:", parseError.message);
         fs.unlinkSync(filePath);
         return res.status(400).json({
           success: false,
@@ -268,7 +299,9 @@ router.post(
         });
       }
 
+      // console.log("Inserting comments...");
       const insertResult = await CommentsCollection.insertMany(parsedComments);
+      // console.log("Inserted", insertResult.insertedCount, "comments");
 
       await ProjectsCollection.updateOne(
         { _id: new ObjectId(projectId) },
@@ -289,6 +322,7 @@ router.post(
       );
 
       fs.unlinkSync(filePath);
+      // console.log("Temporary file deleted");
 
       res.status(200).json({
         success: true,
@@ -299,12 +333,12 @@ router.post(
         },
       });
     } catch (err) {
-      console.error("Upload error:", err);
+      // console.error("Upload error:", err);
       if (req.file && req.file.path) {
         try {
           fs.unlinkSync(req.file.path);
         } catch (cleanupErr) {
-          console.error("Error deleting file:", cleanupErr);
+          // console.error("Error deleting file:", cleanupErr);
         }
       }
       res.status(500).json({ success: false, error: "Failed to upload file" });
@@ -312,9 +346,10 @@ router.post(
   }
 );
 
-// 📥 DOWNLOAD COMMENTS AS CSV (All comments, including validation data)
+// DOWNLOAD COMMENTS AS CSV
 router.get("/projects/:projectId/download-csv", authenticate, logRequest, async (req, res) => {
   try {
+    // console.log("Downloading CSV for project:", req.params.projectId);
     const db = getDB();
     const ProjectsCollection = db.collection("Projects");
     const CommentsCollection = db.collection("Comments");
@@ -326,14 +361,16 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
 
     const project = await ProjectsCollection.findOne({ _id: new ObjectId(projectId) });
     if (!project) {
+      // console.log("Project not found:", projectId);
       return res.status(404).json({ success: false, error: "Project not found" });
     }
 
     if (req.user.role !== "Admin" && project.assignedTo.toString() !== req.user.userId.toString()) {
+      // console.log("Access denied for CSV download:", req.user.username);
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
-    // Fetch all comments for this project
+    // console.log("Fetching comments...");
     const comments = await CommentsCollection.find({
       projectId: new ObjectId(projectId),
     }).toArray();
@@ -341,6 +378,8 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
     if (comments.length === 0) {
       return res.status(404).json({ success: false, error: "No comments found for this project" });
     }
+
+    // console.log("Found", comments.length, "comments, building CSV");
 
     // Build CSV header
     const headers = [
@@ -366,10 +405,9 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
       new Date(c.createdAt).toISOString(),
     ]);
 
-    // Combine headers and rows
     const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    // console.log("CSV generated, size:", csvContent.length);
 
-    // Set response headers for file download
     res.setHeader("Content-Type", "text/csv");
     res.setHeader(
       "Content-Disposition",
@@ -378,9 +416,9 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
 
     res.status(200).send(csvContent);
   } catch (err) {
-    console.error("Download CSV error:", err);
+    // console.error("Download CSV error:", err);
     res.status(500).json({ success: false, error: "Failed to download CSV" });
   }
 });
 
-module.exports = router;    
+module.exports = router;
