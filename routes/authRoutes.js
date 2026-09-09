@@ -6,233 +6,300 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { authenticate } = require("../middleware");
 
+// Simple in-memory login attempt tracking
+const loginAttempts = {};
+
 // Helper to check owner or admin
 const isOwnerOrAdmin = (userId, user) => {
-  return user.userId.toString() === userId || user.role === "Admin";
+    return user.userId.toString() === userId || user.role === "Admin";
 };
+
+// Clean up old login attempts every hour
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, data] of Object.entries(loginAttempts)) {
+        if (data.lockUntil && data.lockUntil < now) {
+            delete loginAttempts[key];
+        }
+    }
+}, 60 * 60 * 1000);
 
 /* LOGIN */
 router.post("/login", async (req, res) => {
-  try {
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const { username, password } = req.body;
+    try {
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const { username, password } = req.body;
 
-    const user = await UsersCollection.findOne({
-      $or: [{ username }, { email: username.toLowerCase() }],
-    });
+        // Check if username/email is locked
+        const identifier = username?.toLowerCase();
+        if (identifier && loginAttempts[identifier]) {
+            const attempt = loginAttempts[identifier];
+            // If locked and lock hasn't expired
+            if (attempt.lockUntil && attempt.lockUntil > Date.now()) {
+                const remainingMinutes = Math.ceil((attempt.lockUntil - Date.now()) / 60000);
+                return res.status(429).json({
+                    success: false,
+                    error: `Account locked. Try again in ${remainingMinutes} minutes.`
+                });
+            }
+            // Lock expired, remove entry
+            if (attempt.lockUntil && attempt.lockUntil <= Date.now()) {
+                delete loginAttempts[identifier];
+            }
+        }
 
-    if (!user) {
-      return res.status(401).json({ success: false, error: "Invalid credentials" });
+        const user = await UsersCollection.findOne({
+            $or: [{ username }, { email: username?.toLowerCase() }],
+        });
+
+        if (!user) {
+            // Track failed attempt
+            if (identifier) {
+                if (!loginAttempts[identifier]) {
+                    loginAttempts[identifier] = { count: 0 };
+                }
+                loginAttempts[identifier].count += 1;
+                
+                // Lock after 5 failed attempts
+                if (loginAttempts[identifier].count >= 5) {
+                    loginAttempts[identifier].lockUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
+                    return res.status(429).json({
+                        success: false,
+                        error: "Too many failed attempts. Account locked for 15 minutes."
+                    });
+                }
+            }
+            return res.status(401).json({ success: false, error: "Invalid credentials" });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            // Track failed attempt
+            if (identifier) {
+                if (!loginAttempts[identifier]) {
+                    loginAttempts[identifier] = { count: 0 };
+                }
+                loginAttempts[identifier].count += 1;
+                
+                if (loginAttempts[identifier].count >= 5) {
+                    loginAttempts[identifier].lockUntil = Date.now() + 15 * 60 * 1000;
+                    return res.status(429).json({
+                        success: false,
+                        error: "Too many failed attempts. Account locked for 15 minutes."
+                    });
+                }
+            }
+            return res.status(401).json({ success: false, error: "Invalid credentials" });
+        }
+
+        // Successful login - clear attempts
+        if (identifier) {
+            delete loginAttempts[identifier];
+        }
+
+        await UsersCollection.updateOne(
+            { _id: user._id },
+            { $set: { lastLogin: new Date(), updatedAt: new Date() } }
+        );
+
+        const token = jwt.sign(
+            { userId: user._id, uid: user.uid, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+
+        const { password: pwd, ...userWithoutPassword } = user;
+        res.status(200).json({
+            success: true,
+            message: "Login successful",
+            data: { user: userWithoutPassword, token },
+        });
+    } catch (err) {
+        console.error("Login error:", err);
+        res.status(500).json({ success: false, error: "Failed to login" });
     }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, error: "Invalid credentials" });
-    }
-
-    await UsersCollection.updateOne(
-      { _id: user._id },
-      { $set: { lastLogin: new Date(), updatedAt: new Date() } }
-    );
-
-    const token = jwt.sign(
-      { userId: user._id, uid: user.uid, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    const { password: pwd, ...userWithoutPassword } = user;
-    res.status(200).json({
-      success: true,
-      message: "Login successful",
-      data: { user: userWithoutPassword, token },
-    });
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ success: false, error: "Failed to login" });
-  }
 });
 
 /* CREATE ACCOUNT */
 router.post("/create-account", async (req, res) => {
-  try {
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const { username, email, password, role } = req.body;
+    try {
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const { username, email, password, role } = req.body;
 
-    const existing = await UsersCollection.findOne({
-      $or: [{ username }, { email: email.toLowerCase() }],
-    });
-    if (existing) {
-      return res.status(400).json({ success: false, error: "Username or email already exists" });
+        const existing = await UsersCollection.findOne({
+            $or: [{ username }, { email: email.toLowerCase() }],
+        });
+        if (existing) {
+            return res.status(400).json({ success: false, error: "Username or email already exists" });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = {
+            username,
+            email: email.toLowerCase(),
+            password: hashedPassword,
+            uid: new ObjectId().toString(),
+            role: role || "Annotator",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        const result = await UsersCollection.insertOne(newUser);
+
+        const token = jwt.sign(
+            { userId: result.insertedId, uid: newUser.uid, role: newUser.role },
+            process.env.JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+
+        const { password: pwd, ...userWithoutPassword } = newUser;
+        res.status(201).json({
+            success: true,
+            message: "Account created",
+            data: { user: { ...userWithoutPassword, _id: result.insertedId }, token },
+        });
+    } catch (err) {
+        console.error("Create account error:", err);
+        res.status(500).json({ success: false, error: "Failed to create account" });
     }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = {
-      username,
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      uid: new ObjectId().toString(),
-      role: role || "Annotator",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await UsersCollection.insertOne(newUser);
-
-    const token = jwt.sign(
-      { userId: result.insertedId, uid: newUser.uid, role: newUser.role },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    const { password: pwd, ...userWithoutPassword } = newUser;
-    res.status(201).json({
-      success: true,
-      message: "Account created",
-      data: { user: { ...userWithoutPassword, _id: result.insertedId }, token },
-    });
-  } catch (err) {
-    console.error("Create account error:", err);
-    res.status(500).json({ success: false, error: "Failed to create account" });
-  }
 });
 
 /* CHANGE PASSWORD */
 router.put("/change-password/:userId", authenticate, async (req, res) => {
-  try {
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const { userId } = req.params;
-    const { currentPassword, newPassword } = req.body;
+    try {
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const { userId } = req.params;
+        const { currentPassword, newPassword } = req.body;
 
-    if (!isOwnerOrAdmin(userId, req.user)) {
-      return res.status(403).json({ success: false, error: "Access denied" });
+        if (!isOwnerOrAdmin(userId, req.user)) {
+            return res.status(403).json({ success: false, error: "Access denied" });
+        }
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ success: false, error: "Invalid user ID" });
+        }
+
+        const user = await UsersCollection.findOne({ _id: new ObjectId(userId) });
+        if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ success: false, error: "Current password is incorrect" });
+        }
+
+        const hashed = await bcrypt.hash(newPassword, 10);
+        await UsersCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $set: { password: hashed, updatedAt: new Date() } }
+        );
+
+        res.status(200).json({ success: true, message: "Password changed" });
+    } catch (err) {
+        console.error("Change password error:", err);
+        res.status(500).json({ success: false, error: "Failed to change password" });
     }
-    if (!ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
-    }
-
-    const user = await UsersCollection.findOne({ _id: new ObjectId(userId) });
-    if (!user) return res.status(404).json({ success: false, error: "User not found" });
-
-    const isMatch = await bcrypt.compare(currentPassword, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, error: "Current password is incorrect" });
-    }
-
-    const hashed = await bcrypt.hash(newPassword, 10);
-    await UsersCollection.updateOne(
-      { _id: new ObjectId(userId) },
-      { $set: { password: hashed, updatedAt: new Date() } }
-    );
-
-    res.status(200).json({ success: true, message: "Password changed" });
-  } catch (err) {
-    console.error("Change password error:", err);
-    res.status(500).json({ success: false, error: "Failed to change password" });
-  }
 });
 
 /* UPDATE ACCOUNT (username, email, role) */
 router.put("/update-account/:userId", authenticate, async (req, res) => {
-  try {
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const { userId } = req.params;
-    const { username, email, role } = req.body;
+    try {
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const { userId } = req.params;
+        const { username, email, role } = req.body;
 
-    if (!isOwnerOrAdmin(userId, req.user)) {
-      return res.status(403).json({ success: false, error: "Access denied" });
+        if (!isOwnerOrAdmin(userId, req.user)) {
+            return res.status(403).json({ success: false, error: "Access denied" });
+        }
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ success: false, error: "Invalid user ID" });
+        }
+
+        const user = await UsersCollection.findOne({ _id: new ObjectId(userId) });
+        if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+        const updateFields = { updatedAt: new Date() };
+
+        if (username && username !== user.username) {
+            const existing = await UsersCollection.findOne({
+                username,
+                _id: { $ne: new ObjectId(userId) },
+            });
+            if (existing) {
+                return res.status(400).json({ success: false, error: "Username already taken" });
+            }
+            updateFields.username = username;
+        }
+
+        if (email && email.toLowerCase() !== user.email) {
+            const existing = await UsersCollection.findOne({
+                email: email.toLowerCase(),
+                _id: { $ne: new ObjectId(userId) },
+            });
+            if (existing) {
+                return res.status(400).json({ success: false, error: "Email already taken" });
+            }
+            updateFields.email = email.toLowerCase();
+        }
+
+        if (role && req.user.role === "Admin") {
+            updateFields.role = role;
+        }
+
+        await UsersCollection.updateOne({ _id: new ObjectId(userId) }, { $set: updateFields });
+
+        const updated = await UsersCollection.findOne({ _id: new ObjectId(userId) });
+        const { password, ...rest } = updated;
+        res.status(200).json({ success: true, message: "Account updated", data: rest });
+    } catch (err) {
+        console.error("Update account error:", err);
+        res.status(500).json({ success: false, error: "Failed to update account" });
     }
-    if (!ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
-    }
-
-    const user = await UsersCollection.findOne({ _id: new ObjectId(userId) });
-    if (!user) return res.status(404).json({ success: false, error: "User not found" });
-
-    const updateFields = { updatedAt: new Date() };
-
-    if (username && username !== user.username) {
-      const existing = await UsersCollection.findOne({
-        username,
-        _id: { $ne: new ObjectId(userId) },
-      });
-      if (existing) {
-        return res.status(400).json({ success: false, error: "Username already taken" });
-      }
-      updateFields.username = username;
-    }
-
-    if (email && email.toLowerCase() !== user.email) {
-      const existing = await UsersCollection.findOne({
-        email: email.toLowerCase(),
-        _id: { $ne: new ObjectId(userId) },
-      });
-      if (existing) {
-        return res.status(400).json({ success: false, error: "Email already taken" });
-      }
-      updateFields.email = email.toLowerCase();
-    }
-
-    if (role && req.user.role === "Admin") {
-      updateFields.role = role;
-    }
-
-    await UsersCollection.updateOne({ _id: new ObjectId(userId) }, { $set: updateFields });
-
-    const updated = await UsersCollection.findOne({ _id: new ObjectId(userId) });
-    const { password, ...rest } = updated;
-    res.status(200).json({ success: true, message: "Account updated", data: rest });
-  } catch (err) {
-    console.error("Update account error:", err);
-    res.status(500).json({ success: false, error: "Failed to update account" });
-  }
 });
 
 /* GET ALL USERS (Admin only) */
 router.get("/users", authenticate, async (req, res) => {
-  try {
-    if (req.user.role !== "Admin") {
-      return res.status(403).json({ success: false, error: "Admin only" });
+    try {
+        if (req.user.role !== "Admin") {
+            return res.status(403).json({ success: false, error: "Admin only" });
+        }
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const users = await UsersCollection.find({}).toArray();
+        const cleaned = users.map(({ password, ...rest }) => rest);
+        res.status(200).json({ success: true, count: cleaned.length, data: cleaned });
+    } catch (err) {
+        console.error("Get users error:", err);
+        res.status(500).json({ success: false, error: "Failed to fetch users" });
     }
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const users = await UsersCollection.find({}).toArray();
-    const cleaned = users.map(({ password, ...rest }) => rest);
-    res.status(200).json({ success: true, count: cleaned.length, data: cleaned });
-  } catch (err) {
-    console.error("Get users error:", err);
-    res.status(500).json({ success: false, error: "Failed to fetch users" });
-  }
 });
 
 /* HARD DELETE ACCOUNT */
 router.delete("/delete-account/:userId", authenticate, async (req, res) => {
-  try {
-    const db = getDB();
-    const UsersCollection = db.collection("Users");
-    const { userId } = req.params;
+    try {
+        const db = getDB();
+        const UsersCollection = db.collection("Users");
+        const { userId } = req.params;
 
-    if (!isOwnerOrAdmin(userId, req.user)) {
-      return res.status(403).json({ success: false, error: "Access denied" });
-    }
-    if (!ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
-    }
+        if (!isOwnerOrAdmin(userId, req.user)) {
+            return res.status(403).json({ success: false, error: "Access denied" });
+        }
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ success: false, error: "Invalid user ID" });
+        }
 
-    const result = await UsersCollection.deleteOne({ _id: new ObjectId(userId) });
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
+        const result = await UsersCollection.deleteOne({ _id: new ObjectId(userId) });
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ success: false, error: "User not found" });
+        }
 
-    res.status(200).json({ success: true, message: "Account permanently deleted" });
-  } catch (err) {
-    console.error("Delete account error:", err);
-    res.status(500).json({ success: false, error: "Failed to delete account" });
-  }
+        res.status(200).json({ success: true, message: "Account permanently deleted" });
+    } catch (err) {
+        console.error("Delete account error:", err);
+        res.status(500).json({ success: false, error: "Failed to delete account" });
+    }
 });
 
 module.exports = router;
