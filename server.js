@@ -37,7 +37,7 @@ app.use("/api", projectRoutes);
 app.use("/api", commentRoutes);
 
 // Root
-app.get("/", (res) => {
+app.get("/", (req, res) => {
   res.json({
     message: "Annotator backend is running",
   });

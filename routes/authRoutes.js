@@ -144,46 +144,61 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* CREATE ACCOUNT */
-router.post("/create-account", async (req, res) => {
+/* CREATE ACCOUNT (Admin only) */
+router.post("/create-account", authenticate, async (req, res) => {
   try {
-    // console.log("Creating account for:", req.body.username);
+    if (req.user.role !== "Admin") {
+      return res.status(403).json({ success: false, error: "Admin only" });
+    }
+
     const db = getDB();
     const UsersCollection = db.collection("Users");
     const { username, email, password, role } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "username, email, and password are required",
+      });
+    }
+
+    if (typeof password !== "string" || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: "Password must be at least 8 characters",
+      });
+    }
+
+    const allowedRoles = ["Admin", "Annotator"];
+    const safeRole = allowedRoles.includes(role) ? role : "Annotator";
 
     const existing = await UsersCollection.findOne({
       $or: [{ username }, { email: email.toLowerCase() }],
     });
     if (existing) {
-      // console.log("User already exists:", username);
       return res
         .status(400)
         .json({ success: false, error: "Username or email already exists" });
     }
 
-    // console.log("Hashing password for:", username);
     const hashedPassword = await bcrypt.hash(password, 10);
     const newUser = {
       username,
       email: email.toLowerCase(),
       password: hashedPassword,
       uid: new ObjectId().toString(),
-      role: role || "Annotator",
+      role: safeRole,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    // console.log("New user object created");
 
     const result = await UsersCollection.insertOne(newUser);
-    // console.log("User inserted with ID:", result.insertedId);
 
     const token = jwt.sign(
       { userId: result.insertedId, uid: newUser.uid, role: newUser.role },
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
-    // console.log("JWT generated for new user");
 
     const { password: pwd, ...userWithoutPassword } = newUser;
     res.status(201).json({
@@ -192,7 +207,7 @@ router.post("/create-account", async (req, res) => {
       data: { user: { ...userWithoutPassword, _id: result.insertedId }, token },
     });
   } catch (err) {
-    // console.error("Create account error:", err);
+    console.error("Create account error:", err);
     res.status(500).json({ success: false, error: "Failed to create account" });
   }
 });
