@@ -9,6 +9,7 @@ const { ObjectId } = require("mongodb");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const ExcelJS = require("exceljs"); 
 
 // Middleware
 const { authenticate, logRequest } = require("../middleware");
@@ -387,10 +388,10 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
       "text",
       "language",
       "sentiment",
-      "isValidated",
-      "validatedByUsername",
-      "validatedAt",
-      "createdAt",
+      // "isValidated",
+      // "validatedByUsername",
+      // "validatedAt",
+      // "createdAt",
     ];
 
     // Build CSV rows
@@ -399,10 +400,10 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
       c.text || "",
       c.language || "",
       c.sentiment || "",
-      c.isValidated ? "true" : "false",
-      c.validatedByUsername || "",
-      c.validatedAt ? new Date(c.validatedAt).toISOString() : "",
-      new Date(c.createdAt).toISOString(),
+      // c.isValidated ? "true" : "false",
+      // c.validatedByUsername || "",
+      // c.validatedAt ? new Date(c.validatedAt).toISOString() : "",
+      // new Date(c.createdAt).toISOString(),
     ]);
 
     const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
@@ -418,6 +419,120 @@ router.get("/projects/:projectId/download-csv", authenticate, logRequest, async 
   } catch (err) {
     // console.error("Download CSV error:", err);
     res.status(500).json({ success: false, error: "Failed to download CSV" });
+  }
+});
+
+// DOWNLOAD COMMENTS AS EXCEL
+router.get("/projects/:projectId/download-excel", authenticate, logRequest, async (req, res) => {
+  try {
+    // console.log("Downloading Excel for project:", req.params.projectId);
+    const db = getDB();
+    const ProjectsCollection = db.collection("Projects");
+    const CommentsCollection = db.collection("Comments");
+    const { projectId } = req.params;
+
+    if (!ObjectId.isValid(projectId)) {
+      return res.status(400).json({ success: false, error: "Invalid project ID" });
+    }
+
+    const project = await ProjectsCollection.findOne({ _id: new ObjectId(projectId) });
+    if (!project) {
+      // console.log("Project not found:", projectId);
+      return res.status(404).json({ success: false, error: "Project not found" });
+    }
+
+    if (req.user.role !== "Admin" && project.assignedTo.toString() !== req.user.userId.toString()) {
+      // console.log("Access denied for Excel download:", req.user.username);
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    // console.log("Fetching comments...");
+    const comments = await CommentsCollection.find({
+      projectId: new ObjectId(projectId),
+    }).toArray();
+
+    if (comments.length === 0) {
+      return res.status(404).json({ success: false, error: "No comments found for this project" });
+    }
+
+    // console.log("Found", comments.length, "comments, building Excel");
+
+    // Create workbook and worksheet
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Annotation Platform";
+    workbook.created = new Date();
+
+    const worksheet = workbook.addWorksheet("Comments");
+
+    // Define columns
+    worksheet.columns = [
+      { header: "External ID", key: "externalId", width: 20 },
+      { header: "Text", key: "text", width: 60 },
+      { header: "Language", key: "language", width: 15 },
+      { header: "Sentiment", key: "sentiment", width: 15 },
+      // { header: "Is Validated", key: "isValidated", width: 15 },
+      // { header: "Validated By", key: "validatedByUsername", width: 20 },
+      // { header: "Validated At", key: "validatedAt", width: 22 },
+      // { header: "Created At", key: "createdAt", width: 22 },
+    ];
+
+    // Style the header row
+    worksheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    worksheet.getRow(1).fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF4472C4" },
+    };
+    worksheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
+
+    // Add data rows
+    comments.forEach((c) => {
+      worksheet.addRow({
+        externalId: c.externalId || "",
+        text: c.text || "",
+        language: c.language || "",
+        sentiment: c.sentiment || "",
+        // isValidated: c.isValidated ? "Yes" : "No",
+        // validatedByUsername: c.validatedByUsername || "",
+        // validatedAt: c.validatedAt ? new Date(c.validatedAt) : "",
+        // createdAt: c.createdAt ? new Date(c.createdAt) : "",
+      });
+    });
+
+    // Format date columns
+    // worksheet.getColumn("validatedAt").numFmt = "yyyy-mm-dd hh:mm:ss";
+    // worksheet.getColumn("createdAt").numFmt = "yyyy-mm-dd hh:mm:ss";
+
+    // Add autofilter to header row
+    worksheet.autoFilter = {
+      from: { row: 1, column: 1 },
+      to: { row: 1, column: worksheet.columns.length },
+    };
+
+    // Freeze the header row
+    worksheet.views = [{ state: "frozen", ySplit: 1 }];
+
+    // Build filename
+    const safeName = project.name.replace(/[^a-z0-9]/gi, "_");
+    const filename = `project_${safeName}_comments.xlsx`;
+
+    // Set response headers
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    // Write workbook to response
+    await workbook.xlsx.write(res);
+    res.end();
+
+    // console.log("Excel sent:", filename);
+  } catch (err) {
+    // console.error("Download Excel error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: "Failed to download Excel" });
+    }
   }
 });
 

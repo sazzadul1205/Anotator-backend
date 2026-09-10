@@ -1,6 +1,8 @@
-const logRequest = (req, next) => {
+const logRequest = (req, res, next) => {
   console.log(
-    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - User: ${req.user?.username || "unauthenticated"}`
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - User: ${
+      req.user?.username || "unauthenticated"
+    }`
   );
   next();
 };
