@@ -1,0 +1,226 @@
+========================================
+API REFERENCE - Annotator Backend
+========================================
+
+Base URL: http://localhost:5000/api
+Auth: Bearer JWT in Authorization header
+      Header: Authorization: Bearer <token>
+
+Roles: admin | annotator
+      (Deactivated users cannot log in)
+
+----------------------------------------
+BOOTSTRAP (FIRST-TIME SETUP)
+----------------------------------------
+
+GET    /auth/bootstrap-status
+       Check if any admin account exists.
+       Returns: { success, adminCount }
+       Frontend uses this to show the bootstrap page when adminCount = 0.
+
+POST   /auth/bootstrap
+       Create the FIRST admin account.
+       Body: { name, email, password, confirmPassword }
+       Fails if an admin already exists.
+       Fails if password !== confirmPassword.
+       Returns: { success, message, userId }
+
+----------------------------------------
+AUTHENTICATION
+----------------------------------------
+
+POST   /auth/login
+       Login with email and password.
+       Body: { email, password }
+       Fails if user not found, password wrong, or user is inactive.
+       Rate-limited: 5 attempts / 15 min per IP.
+       Returns: { success, user, token }
+
+POST   /auth/logout
+       Stateless logout (client discards token).
+       Returns: { success }
+
+GET    /auth/me
+       Requires: Bearer token
+       Returns the JWT payload of the current session:
+       { success, user: { userId, role, iat, exp } }
+       Note: does NOT return the full user document.
+
+----------------------------------------
+USER MANAGEMENT (Admin only)
+----------------------------------------
+
+GET    /users
+       List all users.
+       Password fields excluded from response.
+       Returns: { success, users: [...] }
+
+POST   /users
+       Create a new user (admin or annotator).
+       Body: { name, email, password, role }
+       Validates role is "admin" or "annotator".
+       Rejects duplicate email.
+       Returns: { success, message, userId }
+
+GET    /users/:id
+       Get a single user by ID.
+       Password fields excluded.
+       Returns: { success, user }
+
+PATCH  /users/:id
+       Update name and/or email.
+       Body: { name?, email? }
+       Rejects if email is already taken by another user.
+       Returns: { success, message, user }
+
+PATCH  /users/:id/status
+       Toggle user's active status (flips isActive).
+       No body required.
+       Admin cannot toggle their own status.
+       Returns: { success, message, isActive }
+
+POST   /users/:id/reset-password
+       Reset a user's password.
+       Body: { newPassword, confirmPassword }
+       Requires newPassword === confirmPassword.
+       Returns: { success, message }
+
+DELETE /users/:id
+       Force delete (hard delete) a user.
+       Admin cannot delete their own account.
+       Returns: { success, message }
+
+----------------------------------------
+DATASETS & IMPORT
+----------------------------------------
+
+POST   /datasets/import
+       Admin only. Multipart form-data.
+       Fields: file (required), name (optional)
+       File types: .csv, .xlsx
+       Max size: 20 MB
+       Flow:
+         1. Verifies file + creates dataset with status "pending".
+         2. Responds immediately with 202 + datasetId.
+         3. Background worker parses file, inserts comments, updates status.
+       Returns: { success, message, datasetId, status: "pending" }
+       Poll GET /datasets/:id until status is "completed" or "failed".
+
+GET    /datasets
+       List datasets (newest first).
+       Query filters:
+         status      (pending | processing | completed | failed)
+         uploadedBy  (userId)
+       Returns: { success, datasets: [...] }
+
+GET    /datasets/:id
+       Get one dataset by ID.
+       When status = "completed", also returns summary:
+         { total, pending, annotated }
+       Returns: { success, dataset, summary }
+
+PATCH  /datasets/:id
+       Admin only. Rename a dataset.
+       Body: { name }
+       Returns: { success, message }
+
+DELETE /datasets/:id
+       Admin only. Cascade delete:
+         dataset -> all its comments -> all their versions.
+       Returns: { success, message, deletedComments }
+
+----------------------------------------
+COMMENTS CRUD
+----------------------------------------
+
+GET    /comments
+       List comments with filters + pagination.
+       Query params:
+         datasetId    (ObjectId)
+         sentiment    (unannotated | positive | negative | neutral)
+         type         (unclassified | bangla | english | banglish)
+         status       (pending | annotated)
+         assignedTo   (userId)
+         search       (case-insensitive substring on commentText)
+         page         (default 1)
+         limit        (default 50, max 200)
+       Returns: { success, page, limit, total, totalPages, comments }
+
+POST   /comments
+       Manually create a single comment.
+       Body: { datasetId, sourceId, commentText, sentiment?, type? }
+       Rejects duplicate sourceId within the same dataset.
+       Creates version v1 with changeType "create".
+       Returns: { success, message, commentId }
+
+GET    /comments/export
+       Export filtered comments as CSV or XLSX.
+       Query params:
+         format       (csv | xlsx) - default csv
+         + same filters as GET /comments
+       CSV is UTF-8 BOM encoded for Excel compatibility with Bangla.
+       Columns: id, comment_text, sentiment, type, status, version, annotatedAt
+       Response: file download.
+
+GET    /comments/:id
+       Get a single comment.
+       Returns: { success, comment }
+
+PATCH  /comments/:id
+       Update commentText only.
+       Body: { commentText }
+       Creates a new version with changeType "update".
+       Returns: { success, message, version }
+
+DELETE /comments/:id
+       Delete a comment and all its versions.
+       Returns: { success, message }
+
+----------------------------------------
+ANNOTATION
+----------------------------------------
+
+PATCH  /comments/:id/annotation
+       Set sentiment and/or type on a comment.
+       Body: { sentiment?, type?, annotationNote? }
+       Valid sentiments: positive | negative | neutral | unannotated
+       Valid types:      bangla | english | banglish | unclassified
+       Status auto-flips:
+         annotated when BOTH sentiment and type are set.
+         pending   otherwise.
+       Creates a new version with changeType "annotation".
+       Returns: { success, message, version }
+
+       Note: Handled one comment at a time.
+       Bulk annotation is intentionally not exposed but code is kept
+       in the codebase for later activation.
+
+----------------------------------------
+DATA VERSIONING
+----------------------------------------
+
+GET    /comments/:id/versions
+       List all versions of a comment, newest first.
+       Each version contains:
+         version, snapshot, changedFields, changeType, changedBy, createdAt
+       Returns: { success, total, versions }
+
+POST   /comments/:id/restore/:version
+       Restore a comment to a previous version's snapshot.
+       Creates a NEW version with changeType "restore".
+       History is preserved - nothing is deleted.
+       Returns: { success, message, newVersion }
+
+----------------------------------------
+SUMMARY
+----------------------------------------
+Bootstrap        : 2
+Auth             : 3
+User Management  : 7
+Datasets         : 5
+Comments         : 5
+Annotation       : 1
+Versioning       : 2
+----------------------------------------
+TOTAL            : 25 endpoints
+----------------------------------------
