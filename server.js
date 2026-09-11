@@ -3,11 +3,9 @@ const cors = require("cors");
 const helmet = require("helmet");
 require("dotenv").config();
 
-const { connectDB } = require("./config/db");
+const { connectDB, getDB } = require("./config/db");
 
 const app = express();
-
-// Security middleware
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
@@ -36,17 +34,14 @@ app.use("/api/auth", require("./routes/authRoute"));
 app.use("/api/users", require("./routes/userRoute"));
 
 
-// Error handler
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Route not found",
-    path: req.originalUrl,
-  });
-});
+  app.use((req, res) =>
+    res.status(404).json({
+      success: false,
+      error: "Route not found",
+      path: req.originalUrl,
+    })
+  );
 
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+})();
