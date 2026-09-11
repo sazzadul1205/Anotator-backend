@@ -29,11 +29,16 @@ function buildCommentFilter(query) {
   }
   if (query.sentiment) filter.sentiment = query.sentiment;
   if (query.type) filter.type = query.type;
-  if (query.status) filter.status = query.status;
   if (query.assignedTo) {
     const uid = toObjectId(query.assignedTo);
     if (uid) filter.assignedTo = uid;
   }
+  if (query.status) {
+    filter.status = query.status;
+  } else if (query.hideAnnotated === "true") {
+    filter.status = { $ne: "annotated" };
+  }
+
   if (query.search) {
     filter.commentText = { $regex: query.search, $options: "i" };
   }

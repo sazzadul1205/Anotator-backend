@@ -5,7 +5,7 @@ const { parse } = require("csv-parse/sync");
 const ExcelJS = require("exceljs");
 const { ObjectId } = require("mongodb");
 const { getDB } = require("../config/db");
-const { verifyToken, verifyAdmin  } = require("../middleware/auth");
+const { verifyToken, verifyAdmin } = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -377,6 +377,11 @@ router.get("/", verifyToken, async (req, res) => {
     if (req.query.uploadedBy)
       filter.uploadedBy = new ObjectId(req.query.uploadedBy);
 
+    // Annotators only see datasets assigned to them
+    if (req.user.role !== "admin") {
+      filter.assignedTo = new ObjectId(req.user.userId);
+    }
+
     const datasets = await db
       .collection("datasets")
       .find(filter)
@@ -396,7 +401,13 @@ router.get("/", verifyToken, async (req, res) => {
 router.get("/:id", verifyToken, async (req, res) => {
   try {
     const db = getDB();
-    const datasetId = new ObjectId(req.params.id);
+
+    let datasetId;
+    try {
+      datasetId = new ObjectId(req.params.id);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid id" });
+    }
 
     const dataset = await db.collection("datasets").findOne({ _id: datasetId });
     if (!dataset) {
@@ -405,8 +416,18 @@ router.get("/:id", verifyToken, async (req, res) => {
         .json({ success: false, error: "Dataset not found" });
     }
 
-    // Only compute comment counts once import has completed
-    let summary = null;
+    // Annotators can only view datasets assigned to them
+    if (
+      req.user.role !== "admin" &&
+      (!dataset.assignedTo || dataset.assignedTo.toString() !== req.user.userId)
+    ) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
+    }
+
+    // Comment counts (only meaningful after import completes)
+    let summary = { total: 0, pending: 0, annotated: 0 };
     if (dataset.status === "completed") {
       const [total, pending, annotated] = await Promise.all([
         db.collection("comments").countDocuments({ datasetId }),
@@ -426,6 +447,64 @@ router.get("/:id", verifyToken, async (req, res) => {
   }
 });
 
+// PATCH /api/datasets/:id/assign ~ Assign dataset to a user (Admin)
+router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    let datasetId;
+    try {
+      datasetId = new ObjectId(req.params.id);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid id" });
+    }
+
+    const { assignedTo } = req.body;
+
+    const dataset = await db.collection("datasets").findOne({ _id: datasetId });
+    if (!dataset) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Dataset not found" });
+    }
+
+    let newAssignee = null;
+    if (assignedTo !== null && assignedTo !== undefined && assignedTo !== "") {
+      try {
+        newAssignee = new ObjectId(assignedTo);
+      } catch {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid assignedTo" });
+      }
+
+      const user = await db.collection("users").findOne({ _id: newAssignee });
+      if (!user) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Assignee not found" });
+      }
+    }
+
+    await db.collection("datasets").updateOne(
+      { _id: datasetId },
+      {
+        $set: {
+          assignedTo: newAssignee,
+          assignedAt: newAssignee ? new Date() : null,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    res.json({
+      success: true,
+      message: newAssignee ? "Dataset assigned" : "Dataset unassigned",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // PATCH /api/datasets/:id ~ Update Dataset
 router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
@@ -438,12 +517,16 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
         .json({ success: false, error: "name is required" });
     }
 
+    let datasetId;
+    try {
+      datasetId = new ObjectId(req.params.id);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid id" });
+    }
+
     const result = await db
       .collection("datasets")
-      .updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { name, updatedAt: new Date() } },
-      );
+      .updateOne({ _id: datasetId }, { $set: { name, updatedAt: new Date() } });
 
     if (result.matchedCount === 0) {
       return res
@@ -461,7 +544,12 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
 router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
-    const datasetId = new ObjectId(req.params.id);
+    let datasetId;
+    try {
+      datasetId = new ObjectId(req.params.id);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid id" });
+    }
 
     const dataset = await db.collection("datasets").findOne({ _id: datasetId });
     if (!dataset) {
