@@ -571,14 +571,16 @@ router.post("/:id/restore/:version", async (req, res) => {
       },
       changedFields: ["restore"],
       changeType: "restore",
+      restoredFrom: targetVersion,
       changedBy: userId,
       createdAt: new Date(),
     });
 
     res.json({
       success: true,
-      message: `Restored to version ${targetVersion}`,
+      message: `Restored from v${targetVersion}`,
       newVersion,
+      restoredFrom: targetVersion,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

@@ -505,6 +505,126 @@ router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+// POST /api/datasets/:id/duplicate ~ Duplicate dataset + its comments
+router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+
+    let sourceId;
+    try {
+      sourceId = new ObjectId(req.params.id);
+    } catch {
+      return res.status(400).json({ success: false, error: "Invalid id" });
+    }
+
+    const source = await db.collection("datasets").findOne({ _id: sourceId });
+    if (!source) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Dataset not found" });
+    }
+
+    const userId = new ObjectId(req.user.userId);
+    const now = new Date();
+
+    // Body can override the copy's name
+    const newName =
+      (req.body && typeof req.body.name === "string" && req.body.name.trim()) ||
+      `${source.name} (copy)`;
+
+    // 1. Create the new dataset row
+    const newDataset = {
+      name: newName,
+      originalFileName: source.originalFileName,
+      fileType: source.fileType,
+      sheetName: source.sheetName,
+      checksum: source.checksum, 
+      totalRows: source.totalRows,
+      importedRows: source.importedRows,
+      skippedRows: source.skippedRows,
+      status: "completed",
+      importError: null,
+      importErrors: [],
+      uploadedBy: userId,
+      currentVersion: 1,
+      assignedTo: null, 
+      assignedAt: null,
+      createdAt: now,
+      updatedAt: now,
+      duplicatedFrom: sourceId, 
+    };
+
+    const dsResult = await db.collection("datasets").insertOne(newDataset);
+    const newDatasetId = dsResult.insertedId;
+
+    // 2. Copy every comment, remapping _id and datasetId
+    const sourceComments = await db
+      .collection("comments")
+      .find({ datasetId: sourceId })
+      .toArray();
+
+    let copiedCount = 0;
+
+    if (sourceComments.length > 0) {
+      // Build the new comment documents with fresh _ids
+      const idMap = new Map(); 
+
+      const newComments = sourceComments.map((c) => {
+        const newId = new ObjectId();
+        idMap.set(c._id.toString(), newId);
+        copiedCount++;
+
+        return {
+          ...c,
+          _id: newId,
+          datasetId: newDatasetId,
+          createdBy: userId,
+          updatedBy: userId,
+          createdAt: now,
+          updatedAt: now,
+        };
+      });
+
+      await db.collection("comments").insertMany(newComments);
+
+      // 3. Copy every version, remapping commentId
+      const sourceVersions = await db
+        .collection("comment_versions")
+        .find({ commentId: { $in: sourceComments.map((c) => c._id) } })
+        .toArray();
+
+      if (sourceVersions.length > 0) {
+        const newVersions = sourceVersions
+          .map((v) => {
+            const mappedCommentId = idMap.get(v.commentId.toString());
+            if (!mappedCommentId) return null;
+            return {
+              ...v,
+              _id: new ObjectId(),
+              commentId: mappedCommentId,
+              changedBy: userId,
+              createdAt: now,
+            };
+          })
+          .filter(Boolean);
+
+        if (newVersions.length > 0) {
+          await db.collection("comment_versions").insertMany(newVersions);
+        }
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Dataset duplicated",
+      datasetId: newDatasetId,
+      copiedComments: copiedCount,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // PATCH /api/datasets/:id ~ Update Dataset
 router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
