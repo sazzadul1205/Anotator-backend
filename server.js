@@ -43,7 +43,10 @@ app.use("/api", (req, res, next) => {
   if (!db) {
     return res
       .status(503)
-      .json({ success: false, error: "Database not ready. Try again shortly." });
+      .json({
+        success: false,
+        error: "Database not ready. Try again shortly.",
+      });
   }
   next();
 });
@@ -79,7 +82,7 @@ app.get("/", (req, res) => {
 
 // Health check (pings DB)
 app.get("/health", async (req, res) => {
-  let dbStatus
+  let dbStatus;
   try {
     const db = getDB();
     await db.command({ ping: 1 });
