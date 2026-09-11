@@ -33,7 +33,20 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, error: "Too many requests. Please slow down." },
 });
+
+// Apply global rate limiter
 app.use("/api", globalLimiter);
+
+// Check if DB is ready
+app.use("/api", (req, res, next) => {
+  const db = getDB();
+  if (!db) {
+    return res
+      .status(503)
+      .json({ success: false, error: "Database not ready. Try again shortly." });
+  }
+  next();
+});
 
 // Connect to MongoDB + startup cleanup
 connectDB().then(async () => {

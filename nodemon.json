@@ -1,0 +1,5 @@
+{
+  "watch": ["server.js", "routes", "middleware", "config", "scripts"],
+  "ignore": ["*.csv", "*.xlsx", "*.log", "exports/", "tmp/", "test/"],
+  "ext": "js,json"
+}
