@@ -1,36 +1,58 @@
 const jwt = require("jsonwebtoken");
-const { getDB } = require("../config/db");
-const { ObjectId } = require("mongodb");
 
-const authenticate = async (req, res, next) => {
-  try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ success: false, error: "No token provided" });
-    }
+// Middleware to verify token
+function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const db = getDB();
-    const user = await db.collection("Users").findOne({
-      _id: new ObjectId(decoded.userId),
+  // Check if Authorization header exists
+  if (!authHeader) {
+    return res.status(401).json({
+      success: false,
+      error: "No token provided",
     });
+  }
 
-    if (!user) {
-      return res.status(401).json({ success: false, error: "User not found" });
+  // Check Bearer format
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({
+      success: false,
+      error: "Invalid authorization format",
+    });
+  }
+
+  // Extract token
+  const token = authHeader.split(" ")[1];
+
+  // Verify token
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid or expired token",
+      });
     }
 
-    req.user = {
-      userId: user._id,
-      uid: user.uid,
-      username: user.username,
-      email: user.email,
-      role: user.role,
-    };
-    next();
-  } catch (err) {
-    console.error("Auth error:", err);
-    res.status(401).json({ success: false, error: "Invalid token" });
-  }
-};
+    // Attach decoded user information to request
+    req.user = decoded;
 
-module.exports = authenticate;
+    // Pass control to next middleware
+    next();
+  });
+}
+
+// Middleware to verify Admin
+function verifyAdmin(req, res, next) {
+  if (req.user?.role === "admin") {
+    return next();
+  }
+
+  return res.status(403).json({
+    success: false,
+    error: "Unauthorized",
+  });
+}
+
+module.exports = {
+  verifyToken,
+  verifyAdmin,
+};

@@ -24,3 +24,5 @@ Thumbs.db
 dist/
 build/
 coverage/
+
+/Build-Docs
