@@ -338,7 +338,6 @@ router.post(
         importError: null,
         importErrors: [],
         uploadedBy,
-        currentVersion: 1,
         createdAt: now,
         updatedAt: now,
       });
@@ -546,7 +545,6 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
       importError: null,
       importErrors: [],
       uploadedBy: userId,
-      currentVersion: 1,
       assignedTo: null, 
       assignedAt: null,
       createdAt: now,
