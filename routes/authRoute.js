@@ -2,146 +2,159 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
+const { ObjectId } = require("mongodb");
 
-// config
 const { getDB } = require("../config/db");
-
-// Middleware
 const { verifyToken } = require("../middleware/auth");
 
-// Create Router
 const router = express.Router();
 
-// Rate limiter ONLY for login endpoint
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5, 
+  max: 5,
   message: {
     success: false,
     error: "Too many login attempts. Please try again after 15 minutes.",
   },
 });
 
-// Bootstrap Routes
+const bootstrapLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    error: "Too many bootstrap attempts. Try again later.",
+  },
+});
 
-// GET /bootstrap-status ~ Check Admin Availability
-router.get("/bootstrap-status", async (req, res) => {
+// --- Bootstrap ---
+
+router.get("/bootstrap-status", bootstrapLimiter, async (req, res) => {
   try {
-    const db = await getDB();
-    const CountAdmin = await db
+    const db = getDB();
+    const adminCount = await db
       .collection("users")
       .countDocuments({ role: "admin" });
-    res.status(200).json({ success: true, adminCount: CountAdmin });
+    res.json({ success: true, adminCount });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST /bootstrap ~ Create Admin Account
-router.post("/bootstrap", async (req, res) => {
-  try {
-    const db = await getDB();
+router.post("/bootstrap", bootstrapLimiter, async (req, res) => {
+  const db = getDB();
+  let lockClaimed = false;
 
-    // Get the data from the request
+  try {
     const { name, email, password, confirmPassword } = req.body;
 
-    // Check if an admin account already exists
-    const CountAdmin = await db
-      .collection("users")
-      .countDocuments({ role: "admin" });
-
-    if (CountAdmin > 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Admin account already exists",
-      });
-    }
-
-    // Check if the required fields are present
     if (!name || !email || !password || !confirmPassword) {
       return res.status(400).json({ success: false, error: "Missing fields" });
     }
-
-    // Check if the Password and Confirm Password match
     if (password !== confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: "Password and Confirm Password do not match",
-      });
+      return res
+        .status(400)
+        .json({ success: false, error: "Passwords do not match" });
     }
 
-    // Hash the password
+    // Atomic claim — only one request can insert this lock document.
+    try {
+      await db
+        .collection("system_locks")
+        .insertOne({ _id: "admin_bootstrap", claimedAt: new Date() });
+      lockClaimed = true;
+    } catch (err) {
+      if (err.code === 11000) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Admin account already exists" });
+      }
+      throw err;
+    }
+
+    const adminCount = await db
+      .collection("users")
+      .countDocuments({ role: "admin" });
+    if (adminCount > 0) {
+      await db.collection("system_locks").deleteOne({ _id: "admin_bootstrap" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Admin account already exists" });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Create the admin Payload
-    const adminPayload = {
-      email,
-      name,
+    const result = await db.collection("users").insertOne({
+      email: email.toLowerCase().trim(),
+      name: name.trim(),
       password: hashedPassword,
       role: "admin",
       isActive: true,
+      tokenVersion: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
-    };
+    });
 
-    const result = await db.collection("users").insertOne(adminPayload);
-
-    res.status(200).json({
+    res.json({
       success: true,
       message: "Admin account created successfully",
       userId: result.insertedId,
     });
   } catch (err) {
+    if (lockClaimed) {
+      try {
+        await db
+          .collection("system_locks")
+          .deleteOne({ _id: "admin_bootstrap" });
+      } catch {}
+    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// User Routes
+// --- Login / Logout / Me ---
 
-// POST /login ~ Login User
 router.post("/login", loginLimiter, async (req, res) => {
   try {
-    const db = await getDB();
-
-    // Get the data from the request
+    const db = getDB();
     const { email, password } = req.body;
 
-    // Check if the required fields are present
     if (!email || !password) {
       return res.status(400).json({ success: false, error: "Missing fields" });
     }
 
-    // Check if the user exists
     const user = await db
       .collection("users")
-      .findOne({ email: email.toLowerCase() });
-    if (!user) {
-      return res.status(401).json({ success: false, error: "Invalid email" });
-    }
+      .findOne({ email: email.toLowerCase().trim() });
 
-    // Check if user is active
+    if (!user) {
+      return res
+        .status(401)
+        .json({ success: false, error: "Invalid credentials" });
+    }
     if (!user.isActive) {
       return res
         .status(401)
         .json({ success: false, error: "User is inactive" });
     }
 
-    // Check Password Match
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) {
       return res
         .status(401)
-        .json({ success: false, error: "Invalid password" });
+        .json({ success: false, error: "Invalid credentials" });
     }
 
-    // Generate JWT Token
     const token = jwt.sign(
-      { userId: user._id.toString(), role: user.role },
+      {
+        userId: user._id.toString(),
+        role: user.role,
+        tokenVersion: user.tokenVersion || 0,
+      },
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
 
-    // Send the response
     res.json({
       success: true,
       user: {
@@ -160,22 +173,23 @@ router.post("/login", loginLimiter, async (req, res) => {
   }
 });
 
-// POST /logout ~ Logout User
-router.post("/logout", async (req, res) => {
+router.post("/logout", verifyToken, async (req, res) => {
   try {
+    const db = getDB();
+    await db
+      .collection("users")
+      .updateOne(
+        { _id: new ObjectId(req.user.userId) },
+        { $inc: { tokenVersion: 1 }, $set: { updatedAt: new Date() } },
+      );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// GET /me ~ Get User Details
 router.get("/me", verifyToken, async (req, res) => {
-  try {
-    res.json({ success: true, user: req.user });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  res.json({ success: true, user: req.user });
 });
 
 module.exports = router;

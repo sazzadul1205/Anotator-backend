@@ -1,16 +1,13 @@
-// routes/commentRoute.js
 const express = require("express");
 const ExcelJS = require("exceljs");
 const { ObjectId } = require("mongodb");
 const { getDB } = require("../config/db");
-const { verifyToken } = require("../middleware/auth");
+const { verifyToken, verifyAdmin } = require("../middleware/auth");
 
 const router = express.Router();
 
-// All comment routes require a valid token (admin or annotator).
 router.use(verifyToken);
 
-// Small helper: safely convert an id string to ObjectId.
 function toObjectId(id) {
   try {
     return new ObjectId(id);
@@ -19,7 +16,6 @@ function toObjectId(id) {
   }
 }
 
-// Helper: build the MongoDB filter from query params.
 function buildCommentFilter(query) {
   const filter = {};
 
@@ -38,26 +34,56 @@ function buildCommentFilter(query) {
   } else if (query.hideAnnotated === "true") {
     filter.status = { $ne: "annotated" };
   }
-
   if (query.search) {
     filter.commentText = { $regex: query.search, $options: "i" };
   }
   return filter;
 }
 
-// GET /api/comments
+// Returns null for admin (no restriction), else array of ObjectIds.
+async function getAllowedDatasetIds(db, user) {
+  if (user.role === "admin") return null;
+  const datasets = await db
+    .collection("datasets")
+    .find({ assignedTo: new ObjectId(user.userId) }, { projection: { _id: 1 } })
+    .toArray();
+  return datasets.map((d) => d._id);
+}
+
+async function assertCanAccessComment(db, comment, user) {
+  if (user.role === "admin") return true;
+  const dataset = await db
+    .collection("datasets")
+    .findOne({ _id: comment.datasetId }, { projection: { assignedTo: 1 } });
+  if (!dataset?.assignedTo) return false;
+  return dataset.assignedTo.toString() === user.userId;
+}
+
+// List
 router.get("/", async (req, res) => {
   try {
     const db = getDB();
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const skip = (page - 1) * limit;
 
     const filter = buildCommentFilter(req.query);
 
-    const total = await db.collection("comments").countDocuments(filter);
+    // Scope annotators to their assigned datasets
+    const allowedIds = await getAllowedDatasetIds(db, req.user);
+    if (allowedIds !== null) {
+      if (filter.datasetId) {
+        if (!allowedIds.some((id) => id.equals(filter.datasetId))) {
+          return res
+            .status(403)
+            .json({ success: false, error: "Not assigned to you" });
+        }
+      } else {
+        filter.datasetId = { $in: allowedIds };
+      }
+    }
 
-    // Fetch comments
+    const total = await db.collection("comments").countDocuments(filter);
     const comments = await db
       .collection("comments")
       .find(filter)
@@ -79,13 +105,12 @@ router.get("/", async (req, res) => {
   }
 });
 
-// POST /api/comments
+// Create
 router.post("/", async (req, res) => {
   try {
     const db = getDB();
     const { datasetId, sourceId, commentText, sentiment, type } = req.body;
 
-    // Ensure required fields are present
     if (!datasetId || !sourceId || !commentText) {
       return res.status(400).json({
         success: false,
@@ -93,7 +118,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Ensure datasetId is valid
     const dsId = toObjectId(datasetId);
     if (!dsId) {
       return res
@@ -101,7 +125,6 @@ router.post("/", async (req, res) => {
         .json({ success: false, error: "Invalid datasetId" });
     }
 
-    // Ensure dataset exists
     const dataset = await db.collection("datasets").findOne({ _id: dsId });
     if (!dataset) {
       return res
@@ -109,10 +132,24 @@ router.post("/", async (req, res) => {
         .json({ success: false, error: "Dataset not found" });
     }
 
-    // Ensure sourceId is unique within the dataset
+    // Annotators can only add to their own datasets
+    if (req.user.role !== "admin") {
+      if (
+        !dataset.assignedTo ||
+        dataset.assignedTo.toString() !== req.user.userId
+      ) {
+        return res
+          .status(403)
+          .json({ success: false, error: "Not assigned to you" });
+      }
+    }
+
+    const trimmedSourceId = String(sourceId).trim();
+    const trimmedText = String(commentText).trim();
+
     const duplicate = await db
       .collection("comments")
-      .findOne({ datasetId: dsId, sourceId: String(sourceId).trim() });
+      .findOne({ datasetId: dsId, sourceId: trimmedSourceId });
     if (duplicate) {
       return res.status(409).json({
         success: false,
@@ -135,45 +172,56 @@ router.post("/", async (req, res) => {
         ? "pending"
         : "annotated";
 
-    // Create comment
-    const result = await db.collection("comments").insertOne({
-      datasetId: dsId,
-      sourceId: String(sourceId).trim(),
-      commentText: String(commentText).trim(),
-      sentiment: validSentiment,
-      type: validType,
-      status,
-      assignedTo: null,
-      assignedAt: null,
-      assignedBy: null,
-      annotatedBy: status === "annotated" ? userId : null,
-      annotatedAt: status === "annotated" ? new Date() : null,
-      annotationNote: null,
-      version: 1,
-      createdBy: userId,
-      updatedBy: userId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+    const now = new Date();
 
-    // Create initial version record
+    let result;
+    try {
+      result = await db.collection("comments").insertOne({
+        datasetId: dsId,
+        sourceId: trimmedSourceId,
+        commentText: trimmedText,
+        sentiment: validSentiment,
+        type: validType,
+        status,
+        assignedTo: null,
+        assignedAt: null,
+        assignedBy: null,
+        annotatedBy: status === "annotated" ? userId : null,
+        annotatedAt: status === "annotated" ? now : null,
+        annotationNote: null,
+        version: 1,
+        createdBy: userId,
+        updatedBy: userId,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          error: "sourceId already exists in this dataset",
+        });
+      }
+      throw err;
+    }
+
     await db.collection("comment_versions").insertOne({
       commentId: result.insertedId,
       version: 1,
       snapshot: {
-        commentText: String(commentText).trim(),
+        commentText: trimmedText,
         sentiment: validSentiment,
         type: validType,
         status,
         assignedTo: null,
         annotatedBy: status === "annotated" ? userId : null,
-        annotatedAt: status === "annotated" ? new Date() : null,
+        annotatedAt: status === "annotated" ? now : null,
         annotationNote: null,
       },
       changedFields: ["commentText", "sentiment", "type", "status"],
       changeType: "create",
       changedBy: userId,
-      createdAt: new Date(),
+      createdAt: now,
     });
 
     res.status(201).json({
@@ -186,7 +234,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// GET /api/comments/export
+// Export
 router.get("/export", async (req, res) => {
   try {
     const db = getDB();
@@ -199,13 +247,25 @@ router.get("/export", async (req, res) => {
 
     const filter = buildCommentFilter(req.query);
 
+    const allowedIds = await getAllowedDatasetIds(db, req.user);
+    if (allowedIds !== null) {
+      if (filter.datasetId) {
+        if (!allowedIds.some((id) => id.equals(filter.datasetId))) {
+          return res
+            .status(403)
+            .json({ success: false, error: "Not assigned to you" });
+        }
+      } else {
+        filter.datasetId = { $in: allowedIds };
+      }
+    }
+
     const comments = await db
       .collection("comments")
       .find(filter)
       .sort({ createdAt: 1 })
       .toArray();
 
-    // Column layout
     const header = [
       "id",
       "comment_text",
@@ -235,9 +295,11 @@ router.get("/export", async (req, res) => {
         `attachment; filename="comments-${timestamp}.csv"`,
       );
 
-      // Manual CSV builder with proper escaping
+      // Escape + neutralize formula injection
       const escapeCsv = (v) => {
-        const s = v === null || v === undefined ? "" : String(v);
+        let s = v === null || v === undefined ? "" : String(v);
+        // Formula injection guard
+        if (/^[=+\-@]/.test(s)) s = "'" + s;
         if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
         return s;
       };
@@ -246,11 +308,9 @@ router.get("/export", async (req, res) => {
         header.join(","),
         ...rows.map((r) => r.map(escapeCsv).join(",")),
       ];
-      // Prepend UTF-8 BOM so Excel opens Bangla correctly
       return res.send("\uFEFF" + lines.join("\r\n"));
     }
 
-    // XLSX
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("comments");
     sheet.addRow(header);
@@ -272,7 +332,7 @@ router.get("/export", async (req, res) => {
   }
 });
 
-// GET /api/comments/:id
+// Single comment
 router.get("/:id", async (req, res) => {
   try {
     const db = getDB();
@@ -287,13 +347,19 @@ router.get("/:id", async (req, res) => {
         .json({ success: false, error: "Comment not found" });
     }
 
+    if (!(await assertCanAccessComment(db, comment, req.user))) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
+    }
+
     res.json({ success: true, comment });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// PATCH /api/comments/:id
+// Update Comment
 router.patch("/:id", async (req, res) => {
   try {
     const db = getDB();
@@ -315,47 +381,46 @@ router.patch("/:id", async (req, res) => {
         .json({ success: false, error: "Comment not found" });
     }
 
+    if (!(await assertCanAccessComment(db, existing, req.user))) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
+    }
+
     const userId = new ObjectId(req.user.userId);
     const newVersion = existing.version + 1;
-
-    const updated = {
-      ...existing,
-      commentText: commentText.trim(),
-      version: newVersion,
-      updatedBy: userId,
-      updatedAt: new Date(),
-    };
+    const now = new Date();
+    const newText = commentText.trim();
 
     await db.collection("comments").updateOne(
       { _id: id },
       {
         $set: {
-          commentText: updated.commentText,
+          commentText: newText,
           version: newVersion,
           updatedBy: userId,
-          updatedAt: new Date(),
+          updatedAt: now,
         },
       },
     );
 
-    // version record
     await db.collection("comment_versions").insertOne({
       commentId: id,
       version: newVersion,
       snapshot: {
-        commentText: updated.commentText,
-        sentiment: updated.sentiment,
-        type: updated.type,
-        status: updated.status,
-        assignedTo: updated.assignedTo,
-        annotatedBy: updated.annotatedBy,
-        annotatedAt: updated.annotatedAt,
-        annotationNote: updated.annotationNote,
+        commentText: newText,
+        sentiment: existing.sentiment,
+        type: existing.type,
+        status: existing.status,
+        assignedTo: existing.assignedTo,
+        annotatedBy: existing.annotatedBy,
+        annotatedAt: existing.annotatedAt,
+        annotationNote: existing.annotationNote,
       },
       changedFields: ["commentText"],
       changeType: "update",
       changedBy: userId,
-      createdAt: new Date(),
+      createdAt: now,
     });
 
     res.json({
@@ -368,7 +433,7 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// PATCH /api/comments/:id/annotation
+// 
 router.patch("/:id/annotation", async (req, res) => {
   try {
     const db = getDB();
@@ -383,6 +448,12 @@ router.patch("/:id/annotation", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, error: "Comment not found" });
+    }
+
+    if (!(await assertCanAccessComment(db, existing, req.user))) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
     }
 
     const changed = [];
@@ -431,8 +502,8 @@ router.patch("/:id/annotation", async (req, res) => {
     }
 
     const userId = new ObjectId(req.user.userId);
+    const now = new Date();
 
-    // status flips to "annotated" once both fields are set
     const fullyAnnotated =
       newSentiment !== "unannotated" && newType !== "unclassified";
     const newStatus = fullyAnnotated ? "annotated" : "pending";
@@ -449,10 +520,10 @@ router.patch("/:id/annotation", async (req, res) => {
           annotationNote: newNote,
           status: newStatus,
           annotatedBy: userId,
-          annotatedAt: new Date(),
+          annotatedAt: now,
           version: newVersion,
           updatedBy: userId,
-          updatedAt: new Date(),
+          updatedAt: now,
         },
       },
     );
@@ -467,13 +538,13 @@ router.patch("/:id/annotation", async (req, res) => {
         status: newStatus,
         assignedTo: existing.assignedTo,
         annotatedBy: userId,
-        annotatedAt: new Date(),
+        annotatedAt: now,
         annotationNote: newNote,
       },
       changedFields: changed,
       changeType: "annotation",
       changedBy: userId,
-      createdAt: new Date(),
+      createdAt: now,
     });
 
     res.json({
@@ -486,13 +557,26 @@ router.patch("/:id/annotation", async (req, res) => {
   }
 });
 
-// GET /api/comments/:id/versions
 router.get("/:id/versions", async (req, res) => {
   try {
     const db = getDB();
     const id = toObjectId(req.params.id);
     if (!id)
       return res.status(400).json({ success: false, error: "Invalid id" });
+
+    const comment = await db
+      .collection("comments")
+      .findOne({ _id: id }, { projection: { datasetId: 1 } });
+    if (!comment) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Comment not found" });
+    }
+    if (!(await assertCanAccessComment(db, comment, req.user))) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
+    }
 
     const versions = await db
       .collection("comment_versions")
@@ -506,7 +590,6 @@ router.get("/:id/versions", async (req, res) => {
   }
 });
 
-// POST /api/comments/:id/restore/:version
 router.post("/:id/restore/:version", async (req, res) => {
   try {
     const db = getDB();
@@ -514,7 +597,7 @@ router.post("/:id/restore/:version", async (req, res) => {
     if (!id)
       return res.status(400).json({ success: false, error: "Invalid id" });
 
-    const targetVersion = parseInt(req.params.version);
+    const targetVersion = parseInt(req.params.version, 10);
     if (!targetVersion || targetVersion < 1) {
       return res.status(400).json({ success: false, error: "Invalid version" });
     }
@@ -524,6 +607,12 @@ router.post("/:id/restore/:version", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, error: "Comment not found" });
+    }
+
+    if (!(await assertCanAccessComment(db, existing, req.user))) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Not assigned to you" });
     }
 
     const versionRecord = await db.collection("comment_versions").findOne({
@@ -539,6 +628,7 @@ router.post("/:id/restore/:version", async (req, res) => {
     const snap = versionRecord.snapshot;
     const userId = new ObjectId(req.user.userId);
     const newVersion = existing.version + 1;
+    const now = new Date();
 
     await db.collection("comments").updateOne(
       { _id: id },
@@ -551,7 +641,7 @@ router.post("/:id/restore/:version", async (req, res) => {
           annotationNote: snap.annotationNote,
           version: newVersion,
           updatedBy: userId,
-          updatedAt: new Date(),
+          updatedAt: now,
         },
       },
     );
@@ -573,7 +663,7 @@ router.post("/:id/restore/:version", async (req, res) => {
       changeType: "restore",
       restoredFrom: targetVersion,
       changedBy: userId,
-      createdAt: new Date(),
+      createdAt: now,
     });
 
     res.json({
@@ -587,8 +677,8 @@ router.post("/:id/restore/:version", async (req, res) => {
   }
 });
 
-// DELETE /api/comments/:id
-router.delete("/:id", async (req, res) => {
+// Admin-only delete
+router.delete("/:id", verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
     const id = toObjectId(req.params.id);

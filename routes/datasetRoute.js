@@ -9,7 +9,6 @@ const { verifyToken, verifyAdmin } = require("../middleware/auth");
 
 const router = express.Router();
 
-// In-memory upload. Max 20 MB. Only CSV/XLSX.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -24,7 +23,6 @@ const upload = multer({
   },
 });
 
-// Cell value → plain string (handles richText / formula / hyperlink / Date)
 function cellToString(value) {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
@@ -42,7 +40,6 @@ function cellToString(value) {
   return String(value);
 }
 
-// Parse .xlsx buffer
 async function parseXlsx(fileBuffer) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(fileBuffer);
@@ -75,7 +72,6 @@ async function parseXlsx(fileBuffer) {
   return { sheetName: worksheet.name, rows };
 }
 
-// Parse .csv buffer
 function parseCsv(fileBuffer) {
   const rows = parse(fileBuffer, {
     columns: true,
@@ -86,13 +82,11 @@ function parseCsv(fileBuffer) {
   return { sheetName: null, rows };
 }
 
-// Unified parser
 async function parseFile(fileBuffer, originalName) {
   const isCsv = originalName.toLowerCase().endsWith(".csv");
   return isCsv ? parseCsv(fileBuffer) : parseXlsx(fileBuffer);
 }
 
-// Normalize row keys → { id, comment_text, sentiment, type }
 function normalizeRow(row) {
   const out = {};
   for (const key of Object.keys(row)) {
@@ -106,7 +100,6 @@ function normalizeRow(row) {
   return out;
 }
 
-// BACKGROUND WORKER
 async function processImportInBackground({
   db,
   datasetId,
@@ -117,7 +110,6 @@ async function processImportInBackground({
   const startedAt = new Date();
 
   try {
-    // Mark as processing
     await db
       .collection("datasets")
       .updateOne(
@@ -125,14 +117,12 @@ async function processImportInBackground({
         { $set: { status: "processing", updatedAt: startedAt } },
       );
 
-    // 1. Parse
     const { sheetName, rows } = await parseFile(fileBuffer, originalName);
 
     if (!rows.length) {
       throw new Error("File is empty");
     }
 
-    // 2. Validate + build inserts
     const now = new Date();
     const commentsToInsert = [];
     let skipped = 0;
@@ -211,12 +201,10 @@ async function processImportInBackground({
       return;
     }
 
-    // 3. Insert comments
     const inserted = await db
       .collection("comments")
       .insertMany(commentsToInsert);
 
-    // 4. Insert version records
     const versionsToInsert = [];
     if (inserted.insertedIds) {
       Object.values(inserted.insertedIds).forEach((commentId, i) => {
@@ -245,7 +233,6 @@ async function processImportInBackground({
       await db.collection("comment_versions").insertMany(versionsToInsert);
     }
 
-    // 5. Finalize
     await db.collection("datasets").updateOne(
       { _id: datasetId },
       {
@@ -279,7 +266,7 @@ async function processImportInBackground({
   }
 }
 
-// POST /api/datasets/import ~ Import Dataset
+// Import
 router.post(
   "/import",
   verifyToken,
@@ -287,27 +274,22 @@ router.post(
   upload.single("file"),
   async (req, res) => {
     try {
-      // Check if a file was uploaded
       if (!req.file) {
         return res
           .status(400)
           .json({ success: false, error: "No file uploaded" });
       }
 
-      // Parse file
       const originalName = req.file.originalname;
       const fileType = originalName.toLowerCase().endsWith(".csv")
         ? "csv"
         : "xlsx";
 
-      // Check file type
       if (!["csv", "xlsx"].includes(fileType)) {
         return res
           .status(400)
           .json({ success: false, error: "Only .csv and .xlsx files allowed" });
       }
-
-      // Check if file is empty
       if (!req.file.buffer || req.file.buffer.length === 0) {
         return res
           .status(400)
@@ -315,16 +297,26 @@ router.post(
       }
 
       const db = getDB();
-      // Generate checksum
       const checksum = crypto
         .createHash("sha256")
         .update(req.file.buffer)
         .digest("hex");
 
+      // Reject re-uploads of identical files
+      const existing = await db
+        .collection("datasets")
+        .findOne({ checksum }, { projection: { _id: 1, name: 1 } });
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          error: "This exact file has already been imported",
+          datasetId: existing._id,
+        });
+      }
+
       const now = new Date();
       const uploadedBy = new ObjectId(req.user.userId);
 
-      // Create dataset
       const datasetResult = await db.collection("datasets").insertOne({
         name: req.body.name || originalName.replace(/\.(csv|xlsx)$/i, ""),
         originalFileName: originalName,
@@ -338,13 +330,14 @@ router.post(
         importError: null,
         importErrors: [],
         uploadedBy,
+        assignedTo: null,
+        assignedAt: null,
         createdAt: now,
         updatedAt: now,
       });
 
       const datasetId = datasetResult.insertedId;
 
-      // Response
       res.status(202).json({
         success: true,
         message: "Import started. Poll the dataset to track progress.",
@@ -352,7 +345,6 @@ router.post(
         status: "pending",
       });
 
-      // Start Background Process
       processImportInBackground({
         db,
         datasetId,
@@ -366,17 +358,17 @@ router.post(
   },
 );
 
-// GET /api/datasets ~ Get all Datasets
+// List
 router.get("/", verifyToken, async (req, res) => {
   try {
     const db = getDB();
 
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
-    if (req.query.uploadedBy)
+    if (req.query.uploadedBy && ObjectId.isValid(req.query.uploadedBy)) {
       filter.uploadedBy = new ObjectId(req.query.uploadedBy);
+    }
 
-    // Annotators only see datasets assigned to them
     if (req.user.role !== "admin") {
       filter.assignedTo = new ObjectId(req.user.userId);
     }
@@ -387,26 +379,21 @@ router.get("/", verifyToken, async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.json({
-      success: true,
-      datasets,
-    });
+    res.json({ success: true, datasets });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// GET /api/datasets/:id ~ Get Dataset By Id
+// Get by id
 router.get("/:id", verifyToken, async (req, res) => {
   try {
     const db = getDB();
 
-    let datasetId;
-    try {
-      datasetId = new ObjectId(req.params.id);
-    } catch {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, error: "Invalid id" });
     }
+    const datasetId = new ObjectId(req.params.id);
 
     const dataset = await db.collection("datasets").findOne({ _id: datasetId });
     if (!dataset) {
@@ -415,7 +402,6 @@ router.get("/:id", verifyToken, async (req, res) => {
         .json({ success: false, error: "Dataset not found" });
     }
 
-    // Annotators can only view datasets assigned to them
     if (
       req.user.role !== "admin" &&
       (!dataset.assignedTo || dataset.assignedTo.toString() !== req.user.userId)
@@ -425,7 +411,6 @@ router.get("/:id", verifyToken, async (req, res) => {
         .json({ success: false, error: "Not assigned to you" });
     }
 
-    // Comment counts (only meaningful after import completes)
     let summary = { total: 0, pending: 0, annotated: 0 };
     if (dataset.status === "completed") {
       const [total, pending, annotated] = await Promise.all([
@@ -446,16 +431,14 @@ router.get("/:id", verifyToken, async (req, res) => {
   }
 });
 
-// PATCH /api/datasets/:id/assign ~ Assign dataset to a user (Admin)
+// Assign
 router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
-    let datasetId;
-    try {
-      datasetId = new ObjectId(req.params.id);
-    } catch {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, error: "Invalid id" });
     }
+    const datasetId = new ObjectId(req.params.id);
 
     const { assignedTo } = req.body;
 
@@ -468,19 +451,23 @@ router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
 
     let newAssignee = null;
     if (assignedTo !== null && assignedTo !== undefined && assignedTo !== "") {
-      try {
-        newAssignee = new ObjectId(assignedTo);
-      } catch {
+      if (!ObjectId.isValid(assignedTo)) {
         return res
           .status(400)
           .json({ success: false, error: "Invalid assignedTo" });
       }
+      newAssignee = new ObjectId(assignedTo);
 
       const user = await db.collection("users").findOne({ _id: newAssignee });
       if (!user) {
         return res
           .status(404)
           .json({ success: false, error: "Assignee not found" });
+      }
+      if (!user.isActive) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Assignee is inactive" });
       }
     }
 
@@ -504,17 +491,14 @@ router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// POST /api/datasets/:id/duplicate ~ Duplicate dataset + its comments
+// Duplicate
 router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
-
-    let sourceId;
-    try {
-      sourceId = new ObjectId(req.params.id);
-    } catch {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, error: "Invalid id" });
     }
+    const sourceId = new ObjectId(req.params.id);
 
     const source = await db.collection("datasets").findOne({ _id: sourceId });
     if (!source) {
@@ -526,18 +510,16 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
     const userId = new ObjectId(req.user.userId);
     const now = new Date();
 
-    // Body can override the copy's name
     const newName =
       (req.body && typeof req.body.name === "string" && req.body.name.trim()) ||
       `${source.name} (copy)`;
 
-    // 1. Create the new dataset row
     const newDataset = {
       name: newName,
       originalFileName: source.originalFileName,
       fileType: source.fileType,
       sheetName: source.sheetName,
-      checksum: source.checksum, 
+      checksum: source.checksum,
       totalRows: source.totalRows,
       importedRows: source.importedRows,
       skippedRows: source.skippedRows,
@@ -545,17 +527,16 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
       importError: null,
       importErrors: [],
       uploadedBy: userId,
-      assignedTo: null, 
+      assignedTo: null,
       assignedAt: null,
       createdAt: now,
       updatedAt: now,
-      duplicatedFrom: sourceId, 
+      duplicatedFrom: sourceId,
     };
 
     const dsResult = await db.collection("datasets").insertOne(newDataset);
     const newDatasetId = dsResult.insertedId;
 
-    // 2. Copy every comment, remapping _id and datasetId
     const sourceComments = await db
       .collection("comments")
       .find({ datasetId: sourceId })
@@ -564,8 +545,7 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
     let copiedCount = 0;
 
     if (sourceComments.length > 0) {
-      // Build the new comment documents with fresh _ids
-      const idMap = new Map(); 
+      const idMap = new Map();
 
       const newComments = sourceComments.map((c) => {
         const newId = new ObjectId();
@@ -585,7 +565,6 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
 
       await db.collection("comments").insertMany(newComments);
 
-      // 3. Copy every version, remapping commentId
       const sourceVersions = await db
         .collection("comment_versions")
         .find({ commentId: { $in: sourceComments.map((c) => c._id) } })
@@ -623,28 +602,29 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// PATCH /api/datasets/:id ~ Update Dataset
+// Update name
 router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
     const { name } = req.body;
 
-    if (!name) {
+    if (!name || typeof name !== "string" || !name.trim()) {
       return res
         .status(400)
         .json({ success: false, error: "name is required" });
     }
 
-    let datasetId;
-    try {
-      datasetId = new ObjectId(req.params.id);
-    } catch {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, error: "Invalid id" });
     }
+    const datasetId = new ObjectId(req.params.id);
 
     const result = await db
       .collection("datasets")
-      .updateOne({ _id: datasetId }, { $set: { name, updatedAt: new Date() } });
+      .updateOne(
+        { _id: datasetId },
+        { $set: { name: name.trim(), updatedAt: new Date() } },
+      );
 
     if (result.matchedCount === 0) {
       return res
@@ -658,16 +638,14 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/datasets/:id ~ Delete Dataset
+// Delete
 router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
-    let datasetId;
-    try {
-      datasetId = new ObjectId(req.params.id);
-    } catch {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, error: "Invalid id" });
     }
+    const datasetId = new ObjectId(req.params.id);
 
     const dataset = await db.collection("datasets").findOne({ _id: datasetId });
     if (!dataset) {

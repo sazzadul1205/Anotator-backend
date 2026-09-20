@@ -1,58 +1,81 @@
 const jwt = require("jsonwebtoken");
+const { ObjectId } = require("mongodb");
+const { getDB } = require("../config/db");
 
-// Middleware to verify token
-function verifyToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-
-  // Check if Authorization header exists
-  if (!authHeader) {
-    return res.status(401).json({
-      success: false,
-      error: "No token provided",
-    });
-  }
-
-  // Check Bearer format
-  if (!authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({
-      success: false,
-      error: "Invalid authorization format",
-    });
-  }
-
-  // Extract token
-  const token = authHeader.split(" ")[1];
-
-  // Verify token
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(401).json({
-        success: false,
-        error: "Invalid or expired token",
-      });
+async function verifyToken(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res
+        .status(401)
+        .json({ success: false, error: "No token provided" });
+    }
+    if (!authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .json({ success: false, error: "Invalid authorization format" });
     }
 
-    // Attach decoded user information to request
-    req.user = decoded;
+    const token = authHeader.slice(7);
 
-    // Pass control to next middleware
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res
+        .status(401)
+        .json({ success: false, error: "Invalid or expired token" });
+    }
+
+    const db = getDB();
+    if (!db) {
+      return res
+        .status(503)
+        .json({ success: false, error: "Database not ready" });
+    }
+
+    const user = await db.collection("users").findOne(
+      { _id: new ObjectId(payload.userId) },
+      {
+        projection: {
+          password: 0,
+          passwordHash: 0,
+        },
+      },
+    );
+
+    if (!user) {
+      return res.status(401).json({ success: false, error: "User not found" });
+    }
+    if (!user.isActive) {
+      return res
+        .status(401)
+        .json({ success: false, error: "User is inactive" });
+    }
+
+    // Reject tokens issued before the latest logout
+    const tokenVersion = payload.tokenVersion || 0;
+    if ((user.tokenVersion || 0) !== tokenVersion) {
+      return res.status(401).json({ success: false, error: "Token revoked" });
+    }
+
+    req.user = {
+      userId: user._id.toString(),
+      role: user.role,
+      email: user.email,
+      name: user.name,
+    };
+
     next();
-  });
-}
-
-// Middleware to verify Admin
-function verifyAdmin(req, res, next) {
-  if (req.user?.role === "admin") {
-    return next();
+  } catch (err) {
+    console.error("[verifyToken]", err);
+    return res.status(500).json({ success: false, error: "Auth check failed" });
   }
-
-  return res.status(403).json({
-    success: false,
-    error: "Unauthorized",
-  });
 }
 
-module.exports = {
-  verifyToken,
-  verifyAdmin,
-};
+function verifyAdmin(req, res, next) {
+  if (req.user?.role === "admin") return next();
+  return res.status(403).json({ success: false, error: "Unauthorized" });
+}
+
+module.exports = { verifyToken, verifyAdmin };

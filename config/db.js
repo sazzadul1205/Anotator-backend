@@ -4,31 +4,33 @@ dns.setServers(["8.8.8.8"]);
 const { MongoClient, ServerApiVersion } = require("mongodb");
 
 const client = new MongoClient(process.env.MONGO_URI, {
-    serverApi: {
-        version: ServerApiVersion.v1,
-        strict: false,
-        deprecationErrors: true,
-    }
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: false,
+    deprecationErrors: true,
+  },
 });
 
-let db;
+let db = null;
 
 async function connectDB() {
-    try {
-        await client.connect();
-        await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
-        
-        db = client.db(process.env.DB_NAME || "annotator_db");
-        return db;
-    } catch (error) {
-        console.error("MongoDB connection failed:", error);
-        process.exit(1);
-    }
+  if (db) return db; 
+  try {
+    await client.connect();
+    await client.db("admin").command({ ping: 1 });
+    console.log("✅ Connected to MongoDB");
+
+    db = client.db(process.env.DB_NAME || "annotator_db");
+    return db;
+  } catch (error) {
+    console.error("❌ MongoDB connection failed:", error);
+    process.exit(1);
+  }
 }
 
+// Synchronous getter — returns null until connectDB() has resolved.
 function getDB() {
-    return db;
+  return db;
 }
 
 module.exports = { connectDB, getDB };

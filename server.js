@@ -6,10 +6,10 @@ const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const { connectDB, getDB } = require("./config/db");
+const { ensureIndexes, cleanupStaleImports } = require("./config/indexes");
 
 const app = express();
 
-// Security
 if (process.env.NODE_ENV === "production") {
   app.set("trust proxy", 1);
 }
@@ -18,14 +18,12 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// Request logging
 if (process.env.NODE_ENV === "production") {
   app.use(morgan("combined"));
 } else {
   app.use(morgan("dev"));
 }
 
-// Global rate limiter
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: process.env.NODE_ENV === "production" ? 300 : 10000,
@@ -34,45 +32,18 @@ const globalLimiter = rateLimit({
   message: { success: false, error: "Too many requests. Please slow down." },
 });
 
-// Apply global rate limiter
 app.use("/api", globalLimiter);
 
-// Check if DB is ready
+// DB readiness guard
 app.use("/api", (req, res, next) => {
   const db = getDB();
   if (!db) {
-    return res
-      .status(503)
-      .json({
-        success: false,
-        error: "Database not ready. Try again shortly.",
-      });
+    return res.status(503).json({
+      success: false,
+      error: "Database not ready. Try again shortly.",
+    });
   }
   next();
-});
-
-// Connect to MongoDB + startup cleanup
-connectDB().then(async () => {
-  try {
-    const db = getDB();
-    const result = await db.collection("datasets").updateMany(
-      { status: { $in: ["pending", "processing"] } },
-      {
-        $set: {
-          status: "failed",
-          importError: "Server restarted during import",
-          updatedAt: new Date(),
-        },
-      },
-    );
-    if (result.modifiedCount > 0) {
-      console.log(
-        `[startup] marked ${result.modifiedCount} stuck dataset(s) as failed`,
-      );
-    }
-  } catch (err) {
-    console.error("[startup] failed to reset stuck imports:", err.message);
-  }
 });
 
 // Root
@@ -80,7 +51,7 @@ app.get("/", (req, res) => {
   res.json({ message: "Annotator backend is running" });
 });
 
-// Health check (pings DB)
+// Health check
 app.get("/health", async (req, res) => {
   let dbStatus;
   try {
@@ -117,7 +88,7 @@ app.use((req, res) =>
   }),
 );
 
-// Centralized error handler (must be last, 4 args)
+// Central error handler
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("[error]", err);
@@ -130,23 +101,37 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 5000;
+let server;
 
-const server = app.listen(PORT, () => {
-  console.log(
-    `Server running on http://localhost:${PORT}  [NODE_ENV=${process.env.NODE_ENV || "development"}]`,
-  );
+async function start() {
+  await connectDB();
+  const db = getDB();
+
+  await ensureIndexes(db);
+  await cleanupStaleImports(db);
+
+  server = app.listen(PORT, () => {
+    console.log(
+      `🚀 Server running on http://localhost:${PORT}  [NODE_ENV=${
+        process.env.NODE_ENV || "development"
+      }]`,
+    );
+  });
+}
+
+start().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
 });
 
-// Graceful shutdown
 function shutdown(signal) {
   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  if (!server) process.exit(0);
   server.close(() => {
     console.log("HTTP server closed.");
     process.exit(0);
   });
-
   setTimeout(() => {
     console.error("Forced shutdown after 10s.");
     process.exit(1);
