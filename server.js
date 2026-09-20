@@ -89,6 +89,7 @@ app.use("/api/users", require("./routes/userRoute"));
 app.use("/api/datasets", require("./routes/datasetRoute"));
 app.use("/api/comments", require("./routes/commentRoute"));
 app.use("/api/audit", require("./routes/auditRoute"));
+app.use("/api/taxonomies", require("./routes/taxonomyRoute"));
 
 // 404
 app.use((req, res) =>

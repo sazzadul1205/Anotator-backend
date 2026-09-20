@@ -52,10 +52,7 @@ async function getAllowedDatasetIds(db, user) {
   if (user.role === "admin") return null;
   const datasets = await db
     .collection("datasets")
-    .find(
-      { assignedTo: new ObjectId(user.userId) },
-      { projection: { _id: 1 } },
-    )
+    .find({ assignedTo: new ObjectId(user.userId) }, { projection: { _id: 1 } })
     .toArray();
   return datasets.map((d) => d._id);
 }
@@ -64,12 +61,62 @@ async function assertCanAccessComment(db, comment, user) {
   if (user.role === "admin") return true;
   const dataset = await db
     .collection("datasets")
-    .findOne(
-      { _id: comment.datasetId },
-      { projection: { assignedTo: 1 } },
-    );
+    .findOne({ _id: comment.datasetId }, { projection: { assignedTo: 1 } });
   if (!dataset?.assignedTo) return false;
   return dataset.assignedTo.toString() === user.userId;
+}
+
+/**
+ * Resolve the set of valid sentiment / type values for a dataset.
+ * Falls back to built-in defaults when the dataset has no taxonomyId
+ * or the referenced taxonomy is missing.
+ *
+ * Always includes the sentinel values "unannotated" and "unclassified"
+ * so the rest of the codebase keeps functioning.
+ */
+async function getValidOptionsForDataset(db, dataset) {
+  let sentiment = new Set(["positive", "negative", "neutral", "unannotated"]);
+  let type = new Set(["bangla", "english", "banglish", "unclassified"]);
+
+  if (dataset && dataset.taxonomyId) {
+    const taxonomy = await db
+      .collection("taxonomies")
+      .findOne(
+        { _id: dataset.taxonomyId },
+        { projection: { sentiment: 1, type: 1 } },
+      );
+
+    if (taxonomy) {
+      if (Array.isArray(taxonomy.sentiment) && taxonomy.sentiment.length) {
+        sentiment = new Set(taxonomy.sentiment.map((x) => x.value));
+      }
+      if (Array.isArray(taxonomy.type) && taxonomy.type.length) {
+        type = new Set(taxonomy.type.map((x) => x.value));
+      }
+    }
+  }
+
+  // Sentinels must always be present so status logic works
+  sentiment.add("unannotated");
+  type.add("unclassified");
+
+  return { sentiment, type };
+}
+
+/**
+ * Fetch datasets by a set of comment documents, keyed by datasetId string.
+ */
+async function getDatasetsForComments(db, comments) {
+  const dsIds = [...new Set(comments.map((c) => c.datasetId.toString()))].map(
+    (id) => new ObjectId(id),
+  );
+  const datasets = await db
+    .collection("datasets")
+    .find({ _id: { $in: dsIds } })
+    .toArray();
+  const map = new Map();
+  datasets.forEach((d) => map.set(d._id.toString(), d));
+  return map;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,14 +223,12 @@ router.post("/", async (req, res) => {
 
     const userId = new ObjectId(req.user.userId);
 
-    const validSentiment = ["positive", "negative", "neutral"].includes(
-      sentiment,
-    )
+    // Dynamic validation against the dataset's taxonomy
+    const validOpts = await getValidOptionsForDataset(db, dataset);
+    const validSentiment = validOpts.sentiment.has(sentiment)
       ? sentiment
       : "unannotated";
-    const validType = ["bangla", "english", "banglish"].includes(type)
-      ? type
-      : "unclassified";
+    const validType = validOpts.type.has(type) ? type : "unclassified";
     const status =
       validSentiment === "unannotated" || validType === "unclassified"
         ? "pending"
@@ -268,23 +313,6 @@ router.post("/bulk-annotate", async (req, res) => {
         .status(400)
         .json({ success: false, error: "Max 200 comments per bulk op" });
     }
-
-    if (
-      sentiment !== undefined &&
-      !["positive", "negative", "neutral", "unannotated"].includes(sentiment)
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Invalid sentiment" });
-    }
-    if (
-      type !== undefined &&
-      !["bangla", "english", "banglish", "unclassified"].includes(type)
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Invalid type" });
-    }
     if (sentiment === undefined && type === undefined && !annotationNote) {
       return res
         .status(400)
@@ -314,6 +342,7 @@ router.post("/bulk-annotate", async (req, res) => {
       });
     }
 
+    // Access control for non-admins
     if (req.user.role !== "admin") {
       const datasetIds = [
         ...new Set(comments.map((c) => c.datasetId.toString())),
@@ -336,6 +365,33 @@ router.post("/bulk-annotate", async (req, res) => {
       }
     }
 
+    // Dynamic validation against each affected dataset's taxonomy
+    if (sentiment !== undefined || type !== undefined) {
+      const datasetsById = await getDatasetsForComments(db, comments);
+
+      for (const c of comments) {
+        const ds = datasetsById.get(c.datasetId.toString());
+        const opts = await getValidOptionsForDataset(db, ds);
+
+        if (sentiment !== undefined && !opts.sentiment.has(sentiment)) {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid sentiment "${sentiment}" for dataset "${
+              ds?.name || c.datasetId.toString()
+            }"`,
+          });
+        }
+        if (type !== undefined && !opts.type.has(type)) {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid type "${type}" for dataset "${
+              ds?.name || c.datasetId.toString()
+            }"`,
+          });
+        }
+      }
+    }
+
     const userId = new ObjectId(req.user.userId);
     const now = new Date();
     const versionsToInsert = [];
@@ -348,9 +404,7 @@ router.post("/bulk-annotate", async (req, res) => {
         sentiment !== undefined ? sentiment : existing.sentiment;
       const newType = type !== undefined ? type : existing.type;
       const newNote =
-        annotationNote !== undefined
-          ? annotationNote
-          : existing.annotationNote;
+        annotationNote !== undefined ? annotationNote : existing.annotationNote;
 
       if (newSentiment !== existing.sentiment) changed.push("sentiment");
       if (newType !== existing.type) changed.push("type");
@@ -730,16 +784,26 @@ router.patch("/:id/annotation", async (req, res) => {
         .json({ success: false, error: "Not assigned to you" });
     }
 
+    // Pull the dataset so we can resolve its taxonomy
+    const dataset = await db
+      .collection("datasets")
+      .findOne(
+        { _id: existing.datasetId },
+        { projection: { taxonomyId: 1, name: 1 } },
+      );
+    const validOpts = await getValidOptionsForDataset(db, dataset);
+
     const changed = [];
 
     let newSentiment = existing.sentiment;
     if (sentiment !== undefined) {
-      if (
-        !["positive", "negative", "neutral", "unannotated"].includes(sentiment)
-      ) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Invalid sentiment value" });
+      if (!validOpts.sentiment.has(sentiment)) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid sentiment value. Allowed: ${[
+            ...validOpts.sentiment,
+          ].join(", ")}`,
+        });
       }
       if (sentiment !== existing.sentiment) {
         newSentiment = sentiment;
@@ -749,10 +813,13 @@ router.patch("/:id/annotation", async (req, res) => {
 
     let newType = existing.type;
     if (type !== undefined) {
-      if (!["bangla", "english", "banglish", "unclassified"].includes(type)) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Invalid type value" });
+      if (!validOpts.type.has(type)) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid type value. Allowed: ${[...validOpts.type].join(
+            ", ",
+          )}`,
+        });
       }
       if (type !== existing.type) {
         newType = type;
@@ -889,9 +956,7 @@ router.post("/:id/restore/:version", async (req, res) => {
 
     const targetVersion = parseInt(req.params.version, 10);
     if (!targetVersion || targetVersion < 1) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Invalid version" });
+      return res.status(400).json({ success: false, error: "Invalid version" });
     }
 
     const existing = await db.collection("comments").findOne({ _id: id });

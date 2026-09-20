@@ -440,6 +440,8 @@ async function processImportInBackground({
 
 /* ---------- Import ---------- */
 
+/* ---------- Import ---------- */
+
 router.post(
   "/import",
   verifyToken,
@@ -493,6 +495,35 @@ router.post(
         req.body.dedupeStrategy === "rename" ? "rename" : "skip";
 
       const db = getDB();
+
+      // ----- Validate optional taxonomyId -----
+      let taxonomyId = null;
+      let taxonomyName = null;
+      if (req.body.taxonomyId) {
+        let tid;
+        try {
+          tid = new ObjectId(req.body.taxonomyId);
+        } catch {
+          tid = null;
+        }
+        if (!tid) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid taxonomyId" });
+        }
+        const tax = await db
+          .collection("taxonomies")
+          .findOne({ _id: tid, isActive: true });
+        if (!tax) {
+          return res.status(404).json({
+            success: false,
+            error: "Taxonomy not found or inactive",
+          });
+        }
+        taxonomyId = tid;
+        taxonomyName = tax.name;
+      }
+
       const checksum = crypto
         .createHash("sha256")
         .update(req.file.buffer)
@@ -506,7 +537,7 @@ router.post(
         originalFileName: originalName,
         fileType,
         sheetName: null,
-        checksum, // fingerprint, not used to reject
+        checksum,
         totalRows: 0,
         importedRows: 0,
         skippedRows: 0,
@@ -520,6 +551,9 @@ router.post(
           startedAt: now,
           updatedAt: now,
         },
+        taxonomyId,
+        taxonomyName,
+        taxonomyAssignedAt: taxonomyId ? now : null,
         uploadedBy,
         assignedTo: null,
         assignedAt: null,
@@ -540,6 +574,8 @@ router.post(
           checksum,
           dedupeStrategy,
           datasetName,
+          taxonomyId: taxonomyId ? taxonomyId.toString() : null,
+          taxonomyName,
         },
       });
 
@@ -549,6 +585,8 @@ router.post(
         datasetId,
         status: "pending",
         name: datasetName,
+        taxonomyId: taxonomyId ? taxonomyId.toString() : null,
+        taxonomyName,
       });
 
       // Fire-and-forget
