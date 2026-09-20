@@ -1,4 +1,3 @@
-```js
 const globals = require("globals");
 const eslint = require("@eslint/js");
 
@@ -59,4 +58,3 @@ module.exports = [
     ],
   },
 ];
-```
