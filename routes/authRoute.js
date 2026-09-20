@@ -6,6 +6,7 @@ const { ObjectId } = require("mongodb");
 
 const { getDB } = require("../config/db");
 const { verifyToken } = require("../middleware/auth");
+const { audit } = require("../utils/audit");
 
 const router = express.Router();
 
@@ -49,15 +50,21 @@ router.post("/bootstrap", bootstrapLimiter, async (req, res) => {
     const { name, email, password, confirmPassword } = req.body;
 
     if (!name || !email || !password || !confirmPassword) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing fields" });
     }
     if (password !== confirmPassword) {
       return res
         .status(400)
         .json({ success: false, error: "Passwords do not match" });
     }
+    if (password.length < 6) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Password too short (min 6)" });
+    }
 
-    // Atomic claim — only one request can insert this lock document.
     try {
       await db
         .collection("system_locks")
@@ -76,16 +83,19 @@ router.post("/bootstrap", bootstrapLimiter, async (req, res) => {
       .collection("users")
       .countDocuments({ role: "admin" });
     if (adminCount > 0) {
-      await db.collection("system_locks").deleteOne({ _id: "admin_bootstrap" });
+      await db
+        .collection("system_locks")
+        .deleteOne({ _id: "admin_bootstrap" });
       return res
         .status(400)
         .json({ success: false, error: "Admin account already exists" });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    const normalizedEmail = email.toLowerCase().trim();
 
     const result = await db.collection("users").insertOne({
-      email: email.toLowerCase().trim(),
+      email: normalizedEmail,
       name: name.trim(),
       password: hashedPassword,
       role: "admin",
@@ -93,6 +103,14 @@ router.post("/bootstrap", bootstrapLimiter, async (req, res) => {
       tokenVersion: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
+    });
+
+    await audit({
+      action: "auth.bootstrap",
+      actor: null,
+      targetType: "user",
+      targetId: result.insertedId.toString(),
+      metadata: { email: normalizedEmail },
     });
 
     res.json({
@@ -112,7 +130,7 @@ router.post("/bootstrap", bootstrapLimiter, async (req, res) => {
   }
 });
 
-// --- Login / Logout / Me ---
+// --- Login ---
 
 router.post("/login", loginLimiter, async (req, res) => {
   try {
@@ -120,22 +138,19 @@ router.post("/login", loginLimiter, async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing fields" });
     }
 
     const user = await db
       .collection("users")
       .findOne({ email: email.toLowerCase().trim() });
 
-    if (!user) {
+    if (!user || !user.isActive) {
       return res
         .status(401)
         .json({ success: false, error: "Invalid credentials" });
-    }
-    if (!user.isActive) {
-      return res
-        .status(401)
-        .json({ success: false, error: "User is inactive" });
     }
 
     const passwordMatch = await bcrypt.compare(password, user.password);
@@ -155,6 +170,16 @@ router.post("/login", loginLimiter, async (req, res) => {
       { expiresIn: "7d" },
     );
 
+    await audit({
+      action: "auth.login",
+      actor: {
+        userId: user._id.toString(),
+        email: user.email,
+        role: user.role,
+      },
+      metadata: { ip: req.ip },
+    });
+
     res.json({
       success: true,
       user: {
@@ -173,6 +198,8 @@ router.post("/login", loginLimiter, async (req, res) => {
   }
 });
 
+// --- Logout ---
+
 router.post("/logout", verifyToken, async (req, res) => {
   try {
     const db = getDB();
@@ -182,11 +209,20 @@ router.post("/logout", verifyToken, async (req, res) => {
         { _id: new ObjectId(req.user.userId) },
         { $inc: { tokenVersion: 1 }, $set: { updatedAt: new Date() } },
       );
+
+    await audit({
+      action: "auth.logout",
+      actor: req.user,
+      metadata: { ip: req.ip },
+    });
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// --- Me ---
 
 router.get("/me", verifyToken, async (req, res) => {
   res.json({ success: true, user: req.user });

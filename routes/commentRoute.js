@@ -3,6 +3,7 @@ const ExcelJS = require("exceljs");
 const { ObjectId } = require("mongodb");
 const { getDB } = require("../config/db");
 const { verifyToken, verifyAdmin } = require("../middleware/auth");
+const { audit } = require("../utils/audit");
 
 const router = express.Router();
 
@@ -14,6 +15,10 @@ function toObjectId(id) {
   } catch {
     return null;
   }
+}
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildCommentFilter(query) {
@@ -34,18 +39,23 @@ function buildCommentFilter(query) {
   } else if (query.hideAnnotated === "true") {
     filter.status = { $ne: "annotated" };
   }
-  if (query.search) {
-    filter.commentText = { $regex: query.search, $options: "i" };
+  if (query.search && typeof query.search === "string") {
+    const trimmed = query.search.trim().slice(0, 100);
+    if (trimmed) {
+      filter.commentText = { $regex: escapeRegex(trimmed), $options: "i" };
+    }
   }
   return filter;
 }
 
-// Returns null for admin (no restriction), else array of ObjectIds.
 async function getAllowedDatasetIds(db, user) {
   if (user.role === "admin") return null;
   const datasets = await db
     .collection("datasets")
-    .find({ assignedTo: new ObjectId(user.userId) }, { projection: { _id: 1 } })
+    .find(
+      { assignedTo: new ObjectId(user.userId) },
+      { projection: { _id: 1 } },
+    )
     .toArray();
   return datasets.map((d) => d._id);
 }
@@ -54,12 +64,20 @@ async function assertCanAccessComment(db, comment, user) {
   if (user.role === "admin") return true;
   const dataset = await db
     .collection("datasets")
-    .findOne({ _id: comment.datasetId }, { projection: { assignedTo: 1 } });
+    .findOne(
+      { _id: comment.datasetId },
+      { projection: { assignedTo: 1 } },
+    );
   if (!dataset?.assignedTo) return false;
   return dataset.assignedTo.toString() === user.userId;
 }
 
-// List
+// ---------------------------------------------------------------------------
+// Literal-path routes MUST come before /:id routes
+// ---------------------------------------------------------------------------
+
+// --- List ---
+
 router.get("/", async (req, res) => {
   try {
     const db = getDB();
@@ -69,7 +87,6 @@ router.get("/", async (req, res) => {
 
     const filter = buildCommentFilter(req.query);
 
-    // Scope annotators to their assigned datasets
     const allowedIds = await getAllowedDatasetIds(db, req.user);
     if (allowedIds !== null) {
       if (filter.datasetId) {
@@ -105,7 +122,8 @@ router.get("/", async (req, res) => {
   }
 });
 
-// Create
+// --- Create ---
+
 router.post("/", async (req, res) => {
   try {
     const db = getDB();
@@ -132,7 +150,6 @@ router.post("/", async (req, res) => {
         .json({ success: false, error: "Dataset not found" });
     }
 
-    // Annotators can only add to their own datasets
     if (req.user.role !== "admin") {
       if (
         !dataset.assignedTo ||
@@ -234,7 +251,265 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Export
+// --- Bulk annotate ---
+
+router.post("/bulk-annotate", async (req, res) => {
+  try {
+    const db = getDB();
+    const { ids, sentiment, type, annotationNote } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: "ids must be a non-empty array" });
+    }
+    if (ids.length > 200) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Max 200 comments per bulk op" });
+    }
+
+    if (
+      sentiment !== undefined &&
+      !["positive", "negative", "neutral", "unannotated"].includes(sentiment)
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid sentiment" });
+    }
+    if (
+      type !== undefined &&
+      !["bangla", "english", "banglish", "unclassified"].includes(type)
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid type" });
+    }
+    if (sentiment === undefined && type === undefined && !annotationNote) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Nothing to update" });
+    }
+
+    const objectIds = [];
+    for (const raw of ids) {
+      const oid = toObjectId(raw);
+      if (!oid) {
+        return res
+          .status(400)
+          .json({ success: false, error: `Invalid id: ${raw}` });
+      }
+      objectIds.push(oid);
+    }
+
+    const comments = await db
+      .collection("comments")
+      .find({ _id: { $in: objectIds } })
+      .toArray();
+
+    if (comments.length !== objectIds.length) {
+      return res.status(404).json({
+        success: false,
+        error: "One or more comments not found",
+      });
+    }
+
+    if (req.user.role !== "admin") {
+      const datasetIds = [
+        ...new Set(comments.map((c) => c.datasetId.toString())),
+      ];
+      const allowed = await db
+        .collection("datasets")
+        .find({
+          _id: { $in: datasetIds.map((id) => new ObjectId(id)) },
+          assignedTo: new ObjectId(req.user.userId),
+        })
+        .toArray();
+      const allowedIds = new Set(allowed.map((d) => d._id.toString()));
+      for (const c of comments) {
+        if (!allowedIds.has(c.datasetId.toString())) {
+          return res.status(403).json({
+            success: false,
+            error: "One or more comments are not assigned to you",
+          });
+        }
+      }
+    }
+
+    const userId = new ObjectId(req.user.userId);
+    const now = new Date();
+    const versionsToInsert = [];
+    const bulkOps = [];
+    let updated = 0;
+
+    for (const existing of comments) {
+      const changed = [];
+      const newSentiment =
+        sentiment !== undefined ? sentiment : existing.sentiment;
+      const newType = type !== undefined ? type : existing.type;
+      const newNote =
+        annotationNote !== undefined
+          ? annotationNote
+          : existing.annotationNote;
+
+      if (newSentiment !== existing.sentiment) changed.push("sentiment");
+      if (newType !== existing.type) changed.push("type");
+      if (newNote !== existing.annotationNote) changed.push("annotationNote");
+      if (changed.length === 0) continue;
+
+      const fullyAnnotated =
+        newSentiment !== "unannotated" && newType !== "unclassified";
+      const newStatus = fullyAnnotated ? "annotated" : "pending";
+      if (newStatus !== existing.status) changed.push("status");
+
+      const newVersion = existing.version + 1;
+
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: existing._id },
+          update: {
+            $set: {
+              sentiment: newSentiment,
+              type: newType,
+              annotationNote: newNote,
+              status: newStatus,
+              annotatedBy: userId,
+              annotatedAt: now,
+              version: newVersion,
+              updatedBy: userId,
+              updatedAt: now,
+            },
+          },
+        },
+      });
+
+      versionsToInsert.push({
+        commentId: existing._id,
+        version: newVersion,
+        snapshot: {
+          commentText: existing.commentText,
+          sentiment: newSentiment,
+          type: newType,
+          status: newStatus,
+          assignedTo: existing.assignedTo,
+          annotatedBy: userId,
+          annotatedAt: now,
+          annotationNote: newNote,
+        },
+        changedFields: changed,
+        changeType: "bulk_annotation",
+        changedBy: userId,
+        createdAt: now,
+      });
+
+      updated++;
+    }
+
+    if (bulkOps.length > 0) {
+      await db.collection("comments").bulkWrite(bulkOps);
+      await db.collection("comment_versions").insertMany(versionsToInsert);
+
+      await audit({
+        action: "comment.bulk_annotate",
+        actor: req.user,
+        metadata: { requested: objectIds.length, updated, sentiment, type },
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Bulk annotation applied",
+      requested: objectIds.length,
+      updated,
+      skipped: objectIds.length - updated,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// --- Bulk assign ---
+
+router.post("/bulk-assign", verifyAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    const { ids, assignedTo } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: "ids must be a non-empty array" });
+    }
+    if (ids.length > 500) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Max 500 comments per bulk op" });
+    }
+
+    let newAssignee = null;
+    if (assignedTo !== null && assignedTo !== undefined && assignedTo !== "") {
+      const uid = toObjectId(assignedTo);
+      if (!uid) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid assignedTo" });
+      }
+      const user = await db
+        .collection("users")
+        .findOne({ _id: uid, isActive: true });
+      if (!user) {
+        return res
+          .status(404)
+          .json({ success: false, error: "Assignee not found or inactive" });
+      }
+      newAssignee = uid;
+    }
+
+    const objectIds = [];
+    for (const raw of ids) {
+      const oid = toObjectId(raw);
+      if (!oid) {
+        return res
+          .status(400)
+          .json({ success: false, error: `Invalid id: ${raw}` });
+      }
+      objectIds.push(oid);
+    }
+
+    const now = new Date();
+    const result = await db.collection("comments").updateMany(
+      { _id: { $in: objectIds } },
+      {
+        $set: {
+          assignedTo: newAssignee,
+          assignedAt: newAssignee ? now : null,
+          assignedBy: new ObjectId(req.user.userId),
+          updatedAt: now,
+        },
+      },
+    );
+
+    await audit({
+      action: newAssignee ? "comment.bulk_assign" : "comment.bulk_unassign",
+      actor: req.user,
+      metadata: {
+        count: result.modifiedCount,
+        assignedTo: newAssignee?.toString() || null,
+      },
+    });
+
+    res.json({
+      success: true,
+      message: newAssignee ? "Comments assigned" : "Comments unassigned",
+      updated: result.modifiedCount,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// --- Export ---
+
 router.get("/export", async (req, res) => {
   try {
     const db = getDB();
@@ -295,10 +570,8 @@ router.get("/export", async (req, res) => {
         `attachment; filename="comments-${timestamp}.csv"`,
       );
 
-      // Escape + neutralize formula injection
       const escapeCsv = (v) => {
         let s = v === null || v === undefined ? "" : String(v);
-        // Formula injection guard
         if (/^[=+\-@]/.test(s)) s = "'" + s;
         if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
         return s;
@@ -332,7 +605,10 @@ router.get("/export", async (req, res) => {
   }
 });
 
-// Single comment
+// ---------------------------------------------------------------------------
+// Parameterized routes
+// ---------------------------------------------------------------------------
+
 router.get("/:id", async (req, res) => {
   try {
     const db = getDB();
@@ -359,7 +635,6 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// Update Comment
 router.patch("/:id", async (req, res) => {
   try {
     const db = getDB();
@@ -433,7 +708,6 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-// 
 router.patch("/:id/annotation", async (req, res) => {
   try {
     const db = getDB();
@@ -564,6 +838,10 @@ router.get("/:id/versions", async (req, res) => {
     if (!id)
       return res.status(400).json({ success: false, error: "Invalid id" });
 
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const skip = (page - 1) * limit;
+
     const comment = await db
       .collection("comments")
       .findOne({ _id: id }, { projection: { datasetId: 1 } });
@@ -578,13 +856,25 @@ router.get("/:id/versions", async (req, res) => {
         .json({ success: false, error: "Not assigned to you" });
     }
 
-    const versions = await db
-      .collection("comment_versions")
-      .find({ commentId: id })
-      .sort({ version: -1 })
-      .toArray();
+    const [total, versions] = await Promise.all([
+      db.collection("comment_versions").countDocuments({ commentId: id }),
+      db
+        .collection("comment_versions")
+        .find({ commentId: id })
+        .sort({ version: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+    ]);
 
-    res.json({ success: true, total: versions.length, versions });
+    res.json({
+      success: true,
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      versions,
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -599,7 +889,9 @@ router.post("/:id/restore/:version", async (req, res) => {
 
     const targetVersion = parseInt(req.params.version, 10);
     if (!targetVersion || targetVersion < 1) {
-      return res.status(400).json({ success: false, error: "Invalid version" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid version" });
     }
 
     const existing = await db.collection("comments").findOne({ _id: id });
@@ -677,7 +969,6 @@ router.post("/:id/restore/:version", async (req, res) => {
   }
 });
 
-// Admin-only delete
 router.delete("/:id", verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
@@ -694,6 +985,14 @@ router.delete("/:id", verifyAdmin, async (req, res) => {
 
     await db.collection("comment_versions").deleteMany({ commentId: id });
     await db.collection("comments").deleteOne({ _id: id });
+
+    await audit({
+      action: "comment.delete",
+      actor: req.user,
+      targetType: "comment",
+      targetId: id.toString(),
+      metadata: { datasetId: comment.datasetId.toString() },
+    });
 
     res.json({ success: true, message: "Comment deleted" });
   } catch (err) {

@@ -4,6 +4,7 @@ const { ObjectId } = require("mongodb");
 
 const { getDB } = require("../config/db");
 const { verifyToken, verifyAdmin } = require("../middleware/auth");
+const { audit } = require("../utils/audit");
 
 const router = express.Router();
 
@@ -28,10 +29,14 @@ router.post("/", verifyToken, verifyAdmin, async (req, res) => {
     const { name, email, password, role } = req.body;
 
     if (!name || !email || !password || !role) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing fields" });
     }
     if (!["admin", "annotator"].includes(role)) {
-      return res.status(400).json({ success: false, error: "Invalid role" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid role" });
     }
     if (password.length < 6) {
       return res
@@ -73,6 +78,14 @@ router.post("/", verifyToken, verifyAdmin, async (req, res) => {
       throw err;
     }
 
+    await audit({
+      action: "user.create",
+      actor: req.user,
+      targetType: "user",
+      targetId: result.insertedId.toString(),
+      metadata: { email: normalizedEmail, role },
+    });
+
     res.status(201).json({
       success: true,
       message: "User created successfully",
@@ -88,7 +101,9 @@ router.get("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid user ID" });
     }
 
     const user = await db
@@ -99,7 +114,9 @@ router.get("/:id", verifyToken, verifyAdmin, async (req, res) => {
       );
 
     if (!user) {
-      return res.status(404).json({ success: false, error: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, error: "User not found" });
     }
     res.json({ success: true, user });
   } catch (err) {
@@ -114,17 +131,23 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
     const { name, email } = req.body;
 
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid user ID" });
     }
     if (!name && !email) {
-      return res.status(400).json({ success: false, error: "Missing fields" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing fields" });
     }
 
     const userId = new ObjectId(req.params.id);
 
     const user = await db.collection("users").findOne({ _id: userId });
     if (!user) {
-      return res.status(404).json({ success: false, error: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, error: "User not found" });
     }
 
     const updates = { updatedAt: new Date() };
@@ -145,7 +168,9 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
       updates.email = normalizedEmail;
     }
 
-    await db.collection("users").updateOne({ _id: userId }, { $set: updates });
+    await db
+      .collection("users")
+      .updateOne({ _id: userId }, { $set: updates });
 
     const updatedUser = await db
       .collection("users")
@@ -153,6 +178,14 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
         { _id: userId },
         { projection: { password: 0, passwordHash: 0 } },
       );
+
+    await audit({
+      action: "user.update",
+      actor: req.user,
+      targetType: "user",
+      targetId: userId.toString(),
+      metadata: { updates },
+    });
 
     res.json({
       success: true,
@@ -169,7 +202,9 @@ router.patch("/:id/status", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid user ID" });
     }
 
     const userId = new ObjectId(req.params.id);
@@ -182,7 +217,9 @@ router.patch("/:id/status", verifyToken, verifyAdmin, async (req, res) => {
 
     const user = await db.collection("users").findOne({ _id: userId });
     if (!user) {
-      return res.status(404).json({ success: false, error: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, error: "User not found" });
     }
 
     const newStatus = !user.isActive;
@@ -193,11 +230,19 @@ router.patch("/:id/status", verifyToken, verifyAdmin, async (req, res) => {
         $set: {
           isActive: newStatus,
           updatedAt: new Date(),
-          // Force re-login when re-activated/deactivated
-          ...(newStatus === false && { $inc: { tokenVersion: 1 } }),
         },
+        // Bump tokenVersion when deactivating to force logout
+        ...(newStatus === false ? { $inc: { tokenVersion: 1 } } : {}),
       },
     );
+
+    await audit({
+      action: newStatus ? "user.activate" : "user.deactivate",
+      actor: req.user,
+      targetType: "user",
+      targetId: userId.toString(),
+      metadata: { email: user.email },
+    });
 
     res.json({
       success: true,
@@ -258,10 +303,17 @@ router.post(
         { _id: userId },
         {
           $set: { password: hashedPassword, updatedAt: new Date() },
-          // Force re-login on all devices
           $inc: { tokenVersion: 1 },
         },
       );
+
+      await audit({
+        action: "user.password_reset",
+        actor: req.user,
+        targetType: "user",
+        targetId: userId.toString(),
+        metadata: { email: user.email },
+      });
 
       res.json({ success: true, message: "Password reset successfully" });
     } catch (err) {
@@ -275,7 +327,9 @@ router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ success: false, error: "Invalid user ID" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid user ID" });
     }
 
     const userId = new ObjectId(req.params.id);
@@ -288,10 +342,11 @@ router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
 
     const user = await db.collection("users").findOne({ _id: userId });
     if (!user) {
-      return res.status(404).json({ success: false, error: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, error: "User not found" });
     }
 
-    // Refuse to delete a user still assigned to datasets
     const assignedDatasets = await db
       .collection("datasets")
       .countDocuments({ assignedTo: userId });
@@ -303,6 +358,14 @@ router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
     }
 
     await db.collection("users").deleteOne({ _id: userId });
+
+    await audit({
+      action: "user.delete",
+      actor: req.user,
+      targetType: "user",
+      targetId: userId.toString(),
+      metadata: { email: user.email, role: user.role },
+    });
 
     res.json({ success: true, message: "User deleted successfully" });
   } catch (err) {

@@ -6,6 +6,7 @@ const ExcelJS = require("exceljs");
 const { ObjectId } = require("mongodb");
 const { getDB } = require("../config/db");
 const { verifyToken, verifyAdmin } = require("../middleware/auth");
+const { audit } = require("../utils/audit");
 
 const router = express.Router();
 
@@ -266,7 +267,12 @@ async function processImportInBackground({
   }
 }
 
-// Import
+// ---------------------------------------------------------------------------
+// Literal-path routes first
+// ---------------------------------------------------------------------------
+
+// --- Import ---
+
 router.post(
   "/import",
   verifyToken,
@@ -302,7 +308,6 @@ router.post(
         .update(req.file.buffer)
         .digest("hex");
 
-      // Reject re-uploads of identical files
       const existing = await db
         .collection("datasets")
         .findOne({ checksum }, { projection: { _id: 1, name: 1 } });
@@ -338,6 +343,14 @@ router.post(
 
       const datasetId = datasetResult.insertedId;
 
+      await audit({
+        action: "dataset.import_started",
+        actor: req.user,
+        targetType: "dataset",
+        targetId: datasetId.toString(),
+        metadata: { fileName: originalName, fileType, checksum },
+      });
+
       res.status(202).json({
         success: true,
         message: "Import started. Poll the dataset to track progress.",
@@ -358,7 +371,179 @@ router.post(
   },
 );
 
-// List
+// --- Preview ---
+
+router.post(
+  "/preview",
+  verifyToken,
+  verifyAdmin,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res
+          .status(400)
+          .json({ success: false, error: "No file uploaded" });
+      }
+
+      const originalName = req.file.originalname;
+      const { rows } = await parseFile(req.file.buffer, originalName);
+
+      if (!rows.length) {
+        return res.status(400).json({ success: false, error: "File is empty" });
+      }
+
+      const sample = [];
+      const seenSourceIds = new Set();
+      let valid = 0;
+      let missingIdOrText = 0;
+      let duplicates = 0;
+      const previewErrors = [];
+
+      rows.forEach((raw, idx) => {
+        const row = normalizeRow(raw);
+        const sourceId =
+          row.id !== undefined && row.id !== null ? String(row.id).trim() : "";
+        const text =
+          typeof row.comment_text === "string" ? row.comment_text.trim() : "";
+
+        if (!sourceId || !text) {
+          missingIdOrText++;
+          return;
+        }
+        if (seenSourceIds.has(sourceId)) {
+          duplicates++;
+          if (previewErrors.length < 10) {
+            previewErrors.push(`Row ${idx + 2}: duplicate id "${sourceId}"`);
+          }
+          return;
+        }
+        seenSourceIds.add(sourceId);
+        valid++;
+
+        if (sample.length < 10) {
+          sample.push({
+            sourceId,
+            commentText: text.length > 200 ? text.slice(0, 200) + "…" : text,
+            sentiment: row.sentiment || null,
+            type: row.type || null,
+          });
+        }
+      });
+
+      const checksum = crypto
+        .createHash("sha256")
+        .update(req.file.buffer)
+        .digest("hex");
+
+      const db = getDB();
+      const existingDataset = await db
+        .collection("datasets")
+        .findOne({ checksum }, { projection: { _id: 1, name: 1 } });
+
+      res.json({
+        success: true,
+        preview: {
+          totalRows: rows.length,
+          validRows: valid,
+          missingIdOrText,
+          duplicates,
+          fileName: originalName,
+          checksum,
+          sample,
+          errors: previewErrors,
+          alreadyImported: existingDataset
+            ? {
+                datasetId: existingDataset._id,
+                name: existingDataset.name,
+              }
+            : null,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  },
+);
+
+// --- Stats (dashboard) ---
+
+router.get("/stats", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const [
+      totalDatasets,
+      totalComments,
+      annotatedComments,
+      pendingComments,
+      activeAnnotators,
+      datasetsByStatus,
+      recentComments,
+    ] = await Promise.all([
+      db.collection("datasets").countDocuments({}),
+      db.collection("comments").countDocuments({}),
+      db.collection("comments").countDocuments({ status: "annotated" }),
+      db.collection("comments").countDocuments({ status: "pending" }),
+      db
+        .collection("users")
+        .countDocuments({ role: "annotator", isActive: true }),
+      db
+        .collection("datasets")
+        .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
+        .toArray(),
+      db
+        .collection("comment_versions")
+        .aggregate([
+          { $match: { createdAt: { $gte: sevenDaysAgo } } },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+              },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray(),
+    ]);
+
+    const statusMap = { pending: 0, processing: 0, completed: 0, failed: 0 };
+    datasetsByStatus.forEach((s) => {
+      statusMap[s._id] = s.count;
+    });
+
+    const percentAnnotated =
+      totalComments === 0
+        ? 0
+        : Math.round((annotatedComments / totalComments) * 1000) / 10;
+
+    res.json({
+      success: true,
+      stats: {
+        totalDatasets,
+        totalComments,
+        annotatedComments,
+        pendingComments,
+        activeAnnotators,
+        percentAnnotated,
+        datasetsByStatus: statusMap,
+        activityLast7Days: recentComments.map((r) => ({
+          date: r._id,
+          count: r.count,
+        })),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// --- List (with optional counts) ---
+
 router.get("/", verifyToken, async (req, res) => {
   try {
     const db = getDB();
@@ -368,24 +553,81 @@ router.get("/", verifyToken, async (req, res) => {
     if (req.query.uploadedBy && ObjectId.isValid(req.query.uploadedBy)) {
       filter.uploadedBy = new ObjectId(req.query.uploadedBy);
     }
-
     if (req.user.role !== "admin") {
       filter.assignedTo = new ObjectId(req.user.userId);
     }
 
+    const includeCounts = req.query.includeCounts === "true";
+
+    if (!includeCounts) {
+      const datasets = await db
+        .collection("datasets")
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json({ success: true, datasets });
+    }
+
     const datasets = await db
       .collection("datasets")
-      .find(filter)
-      .sort({ createdAt: -1 })
+      .aggregate([
+        { $match: filter },
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: "comments",
+            let: { dsId: "$_id" },
+            pipeline: [
+              { $match: { $expr: { $eq: ["$datasetId", "$$dsId"] } } },
+              {
+                $group: {
+                  _id: null,
+                  total: { $sum: 1 },
+                  annotated: {
+                    $sum: { $cond: [{ $eq: ["$status", "annotated"] }, 1, 0] },
+                  },
+                  pending: {
+                    $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+                  },
+                },
+              },
+            ],
+            as: "counts",
+          },
+        },
+        {
+          $addFields: {
+            summary: {
+              $ifNull: [
+                { $arrayElemAt: ["$counts", 0] },
+                { total: 0, annotated: 0, pending: 0 },
+              ],
+            },
+          },
+        },
+        { $project: { counts: 0 } },
+      ])
       .toArray();
 
-    res.json({ success: true, datasets });
+    const cleaned = datasets.map((d) => ({
+      ...d,
+      summary: {
+        total: d.summary.total,
+        annotated: d.summary.annotated,
+        pending: d.summary.pending,
+      },
+    }));
+
+    res.json({ success: true, datasets: cleaned });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Get by id
+// ---------------------------------------------------------------------------
+// Parameterized routes
+// ---------------------------------------------------------------------------
+
 router.get("/:id", verifyToken, async (req, res) => {
   try {
     const db = getDB();
@@ -431,7 +673,6 @@ router.get("/:id", verifyToken, async (req, res) => {
   }
 });
 
-// Assign
 router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
@@ -482,6 +723,14 @@ router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
       },
     );
 
+    await audit({
+      action: newAssignee ? "dataset.assign" : "dataset.unassign",
+      actor: req.user,
+      targetType: "dataset",
+      targetId: datasetId.toString(),
+      metadata: { assignedTo: newAssignee?.toString() || null },
+    });
+
     res.json({
       success: true,
       message: newAssignee ? "Dataset assigned" : "Dataset unassigned",
@@ -491,7 +740,6 @@ router.patch("/:id/assign", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// Duplicate
 router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
@@ -591,6 +839,17 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
       }
     }
 
+    await audit({
+      action: "dataset.duplicate",
+      actor: req.user,
+      targetType: "dataset",
+      targetId: newDatasetId.toString(),
+      metadata: {
+        sourceId: sourceId.toString(),
+        copiedComments: copiedCount,
+      },
+    });
+
     res.status(201).json({
       success: true,
       message: "Dataset duplicated",
@@ -602,7 +861,6 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// Update name
 router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
@@ -632,13 +890,20 @@ router.patch("/:id", verifyToken, verifyAdmin, async (req, res) => {
         .json({ success: false, error: "Dataset not found" });
     }
 
+    await audit({
+      action: "dataset.rename",
+      actor: req.user,
+      targetType: "dataset",
+      targetId: datasetId.toString(),
+      metadata: { name: name.trim() },
+    });
+
     res.json({ success: true, message: "Dataset updated" });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Delete
 router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = getDB();
@@ -667,6 +932,17 @@ router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
       await db.collection("comments").deleteMany({ datasetId });
     }
     await db.collection("datasets").deleteOne({ _id: datasetId });
+
+    await audit({
+      action: "dataset.delete",
+      actor: req.user,
+      targetType: "dataset",
+      targetId: datasetId.toString(),
+      metadata: {
+        name: dataset.name,
+        deletedComments: commentIds.length,
+      },
+    });
 
     res.json({
       success: true,

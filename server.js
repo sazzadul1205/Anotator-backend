@@ -7,6 +7,9 @@ require("dotenv").config();
 
 const { connectDB, getDB } = require("./config/db");
 const { ensureIndexes, cleanupStaleImports } = require("./config/indexes");
+const { validateEnv } = require("./config/env");
+
+validateEnv();
 
 const app = express();
 
@@ -15,7 +18,16 @@ if (process.env.NODE_ENV === "production") {
 }
 
 app.use(helmet());
-app.use(cors());
+
+const corsOptions = {
+  origin:
+    process.env.NODE_ENV === "production"
+      ? (process.env.CORS_ORIGIN || "").split(",").filter(Boolean)
+      : true,
+  credentials: true,
+};
+app.use(cors(corsOptions));
+
 app.use(express.json());
 
 if (process.env.NODE_ENV === "production") {
@@ -46,12 +58,10 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
-// Root
 app.get("/", (req, res) => {
   res.json({ message: "Annotator backend is running" });
 });
 
-// Health check
 app.get("/health", async (req, res) => {
   let dbStatus;
   try {
@@ -78,6 +88,7 @@ app.use("/api/auth", require("./routes/authRoute"));
 app.use("/api/users", require("./routes/userRoute"));
 app.use("/api/datasets", require("./routes/datasetRoute"));
 app.use("/api/comments", require("./routes/commentRoute"));
+app.use("/api/audit", require("./routes/auditRoute"));
 
 // 404
 app.use((req, res) =>
@@ -139,4 +150,4 @@ function shutdown(signal) {
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));F
