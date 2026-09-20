@@ -25,8 +25,7 @@ async function ensureIndexes(db) {
     db.collection("datasets").createIndex({ assignedTo: 1 }),
     db.collection("datasets").createIndex({ createdAt: -1 }),
     db.collection("datasets").createIndex({ status: 1 }),
-    db.collection("datasets").createIndex({ checksum: 1 }),
-
+    
     // Audit log
     db.collection("audit_log").createIndex({ at: -1 }),
     db.collection("audit_log").createIndex({ actorId: 1, at: -1 }),

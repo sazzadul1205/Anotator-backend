@@ -10,6 +10,10 @@ const { audit } = require("../utils/audit");
 
 const router = express.Router();
 
+/* ------------------------------------------------------------------ */
+/* Multer                                                              */
+/* ------------------------------------------------------------------ */
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -23,6 +27,10 @@ const upload = multer({
     cb(null, true);
   },
 });
+
+/* ------------------------------------------------------------------ */
+/* Parsing helpers                                                     */
+/* ------------------------------------------------------------------ */
 
 function cellToString(value) {
   if (value === null || value === undefined) return "";
@@ -101,22 +109,65 @@ function normalizeRow(row) {
   return out;
 }
 
+/* ------------------------------------------------------------------ */
+/* Background worker                                                   */
+/* ------------------------------------------------------------------ */
+
 async function processImportInBackground({
   db,
   datasetId,
   fileBuffer,
   originalName,
   uploadedBy,
+  dedupeStrategy = "skip",
 }) {
   const startedAt = new Date();
+  const CHUNK_SIZE = 1000;
+  const datasets = db.collection("datasets");
+
+  // Set progress fields
+  const setProgress = async (patch) => {
+    await datasets.updateOne(
+      { _id: datasetId },
+      {
+        $set: {
+          progress: { ...patch, updatedAt: new Date() },
+          updatedAt: new Date(),
+        },
+      },
+    );
+  };
+
+  // Bump progress.processed without touching the whole object
+  const bumpProcessed = async (processed) => {
+    await datasets.updateOne(
+      { _id: datasetId },
+      {
+        $set: {
+          "progress.processed": processed,
+          "progress.updatedAt": new Date(),
+          updatedAt: new Date(),
+        },
+      },
+    );
+  };
 
   try {
-    await db
-      .collection("datasets")
-      .updateOne(
-        { _id: datasetId },
-        { $set: { status: "processing", updatedAt: startedAt } },
-      );
+    /* ---------- Phase: parsing ---------- */
+    await datasets.updateOne(
+      { _id: datasetId },
+      {
+        $set: {
+          status: "processing",
+          progress: {
+            phase: "parsing",
+            startedAt,
+            updatedAt: startedAt,
+          },
+          updatedAt: startedAt,
+        },
+      },
+    );
 
     const { sheetName, rows } = await parseFile(fileBuffer, originalName);
 
@@ -124,16 +175,44 @@ async function processImportInBackground({
       throw new Error("File is empty");
     }
 
+    /* ---------- Build the insert batch ---------- */
     const now = new Date();
     const commentsToInsert = [];
     let skipped = 0;
+    let renamed = 0;
     const errors = [];
-    const seenSourceIds = new Set();
+    const usedSourceIds = new Set();
+    const rawSourceIds = new Set();
+
+    // Pre-scan to know every raw sourceId — so our generated -dupN
+    // won't collide with a real row in the file
+    rows.forEach((raw) => {
+      const r = normalizeRow(raw);
+      const sid =
+        r.id !== undefined && r.id !== null ? String(r.id).trim() : "";
+      if (sid) rawSourceIds.add(sid);
+    });
+
+    function makeUniqueSourceId(baseId) {
+      let n = 1;
+      let candidate;
+      do {
+        candidate = `${baseId}-dup${n}`;
+        n++;
+        if (n > 10000) {
+          candidate = `${baseId}-dup${Date.now()}-${Math.floor(
+            Math.random() * 1e6,
+          )}`;
+          break;
+        }
+      } while (rawSourceIds.has(candidate) || usedSourceIds.has(candidate));
+      return candidate;
+    }
 
     rows.forEach((raw, idx) => {
       const row = normalizeRow(raw);
 
-      const sourceId =
+      let sourceId =
         row.id !== undefined && row.id !== null ? String(row.id).trim() : "";
       const text =
         typeof row.comment_text === "string" ? row.comment_text.trim() : "";
@@ -143,12 +222,21 @@ async function processImportInBackground({
         return;
       }
 
-      if (seenSourceIds.has(sourceId)) {
-        skipped++;
-        errors.push(`Row ${idx + 2}: duplicate id "${sourceId}"`);
-        return;
+      if (usedSourceIds.has(sourceId)) {
+        if (dedupeStrategy === "rename") {
+          const newId = makeUniqueSourceId(sourceId);
+          errors.push(
+            `Row ${idx + 2}: duplicate id "${sourceId}" renamed to "${newId}"`,
+          );
+          sourceId = newId;
+          renamed++;
+        } else {
+          skipped++;
+          errors.push(`Row ${idx + 2}: duplicate id "${sourceId}" skipped`);
+          return;
+        }
       }
-      seenSourceIds.add(sourceId);
+      usedSourceIds.add(sourceId);
 
       const rawSentiment = (row.sentiment || "").toLowerCase().trim();
       const rawType = (row.type || "").toLowerCase().trim();
@@ -187,7 +275,7 @@ async function processImportInBackground({
     });
 
     if (commentsToInsert.length === 0) {
-      await db.collection("datasets").updateOne(
+      await datasets.updateOne(
         { _id: datasetId },
         {
           $set: {
@@ -195,6 +283,10 @@ async function processImportInBackground({
             skippedRows: skipped,
             importError: "No valid rows found",
             importErrors: errors.slice(0, 20),
+            progress: {
+              phase: "failed",
+              updatedAt: new Date(),
+            },
             updatedAt: new Date(),
           },
         },
@@ -202,15 +294,55 @@ async function processImportInBackground({
       return;
     }
 
-    const inserted = await db
-      .collection("comments")
-      .insertMany(commentsToInsert);
+    /* ---------- Phase: inserting ---------- */
+    const totalToInsert = commentsToInsert.length;
+    await setProgress({
+      phase: "inserting",
+      processed: 0,
+      total: totalToInsert,
+      startedAt: new Date(),
+    });
 
-    const versionsToInsert = [];
-    if (inserted.insertedIds) {
-      Object.values(inserted.insertedIds).forEach((commentId, i) => {
-        const c = commentsToInsert[i];
-        versionsToInsert.push({
+    // Chunked inserts so progress can update along the way.
+    // `insertedIds` in the chunk result is keyed by the index INSIDE the chunk.
+    const insertedPairs = []; // { commentId, originalIndex }
+
+    for (let i = 0; i < commentsToInsert.length; i += CHUNK_SIZE) {
+      const chunk = commentsToInsert.slice(i, i + CHUNK_SIZE);
+      let chunkResult;
+
+      try {
+        chunkResult = await db
+          .collection("comments")
+          .insertMany(chunk, { ordered: false });
+      } catch (err) {
+        // Bulk insert with unique index failures still gives partial success
+        chunkResult = err.result || { insertedIds: {} };
+        if (err.writeErrors) {
+          err.writeErrors.slice(0, 5).forEach((we) => {
+            errors.push(
+              `Insert: ${we.err?.errmsg || we.errmsg || "duplicate"}`,
+            );
+          });
+        }
+      }
+
+      const idsMap = chunkResult.insertedIds || {};
+      for (const [localIdx, commentId] of Object.entries(idsMap)) {
+        insertedPairs.push({
+          commentId,
+          originalIndex: i + Number(localIdx),
+        });
+      }
+
+      await bumpProcessed(Math.min(i + CHUNK_SIZE, totalToInsert));
+    }
+
+    /* ---------- Phase: versions ---------- */
+    const versionsToInsert = insertedPairs.map(
+      ({ commentId, originalIndex }) => {
+        const c = commentsToInsert[originalIndex];
+        return {
           commentId,
           version: 1,
           snapshot: {
@@ -227,39 +359,74 @@ async function processImportInBackground({
           changeType: "import",
           changedBy: uploadedBy,
           createdAt: now,
-        });
-      });
-    }
-    if (versionsToInsert.length) {
-      await db.collection("comment_versions").insertMany(versionsToInsert);
+        };
+      },
+    );
+
+    const totalVersions = versionsToInsert.length;
+    await setProgress({
+      phase: "versions",
+      processed: 0,
+      total: totalVersions,
+      startedAt: new Date(),
+    });
+
+    for (let i = 0; i < versionsToInsert.length; i += CHUNK_SIZE) {
+      const chunk = versionsToInsert.slice(i, i + CHUNK_SIZE);
+      await db.collection("comment_versions").insertMany(chunk);
+      await bumpProcessed(Math.min(i + CHUNK_SIZE, totalVersions));
     }
 
-    await db.collection("datasets").updateOne(
+    /* ---------- Phase: finalizing ---------- */
+    await setProgress({
+      phase: "finalizing",
+      processed: totalToInsert,
+      total: totalToInsert,
+      startedAt: new Date(),
+    });
+
+    const actuallyInserted = insertedPairs.length;
+    const failedInserts = commentsToInsert.length - actuallyInserted;
+
+    await datasets.updateOne(
       { _id: datasetId },
       {
         $set: {
           sheetName,
           totalRows: rows.length,
-          importedRows: commentsToInsert.length,
-          skippedRows: skipped,
+          importedRows: actuallyInserted,
+          skippedRows: skipped + failedInserts,
+          renamedRows: renamed,
           status: "completed",
           importErrors: errors.slice(0, 20),
+          progress: {
+            phase: "completed",
+            processed: totalToInsert,
+            total: totalToInsert,
+            startedAt,
+            updatedAt: new Date(),
+          },
           updatedAt: new Date(),
         },
       },
     );
 
     console.log(
-      `dataset ${datasetId} completed in ${Date.now() - startedAt.getTime()}ms`,
+      `dataset ${datasetId} completed in ${Date.now() - startedAt.getTime()}ms` +
+        ` (imported=${actuallyInserted}, skipped=${skipped}, renamed=${renamed})`,
     );
   } catch (err) {
     console.error(`dataset ${datasetId} failed:`, err.message);
-    await db.collection("datasets").updateOne(
+    await datasets.updateOne(
       { _id: datasetId },
       {
         $set: {
           status: "failed",
           importError: err.message,
+          progress: {
+            phase: "failed",
+            updatedAt: new Date(),
+          },
           updatedAt: new Date(),
         },
       },
@@ -267,11 +434,11 @@ async function processImportInBackground({
   }
 }
 
-// ---------------------------------------------------------------------------
-// Literal-path routes first
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* Literal-path routes first                                           */
+/* ------------------------------------------------------------------ */
 
-// --- Import ---
+/* ---------- Import ---------- */
 
 router.post(
   "/import",
@@ -302,38 +469,57 @@ router.post(
           .json({ success: false, error: "Uploaded file is empty" });
       }
 
+      // ----- Validate name -----
+      let datasetName = "";
+      if (typeof req.body.name === "string") {
+        datasetName = req.body.name.trim();
+      } else if (Array.isArray(req.body.name) && req.body.name.length > 0) {
+        datasetName = String(req.body.name[0]).trim();
+      }
+
+      if (datasetName.length > 120) {
+        return res.status(400).json({
+          success: false,
+          error: "Dataset name must be 120 characters or fewer",
+        });
+      }
+
+      if (!datasetName) {
+        datasetName = originalName.replace(/\.(csv|xlsx)$/i, "");
+      }
+
+      // ----- Validate dedupe strategy -----
+      const dedupeStrategy =
+        req.body.dedupeStrategy === "rename" ? "rename" : "skip";
+
       const db = getDB();
       const checksum = crypto
         .createHash("sha256")
         .update(req.file.buffer)
         .digest("hex");
 
-      const existing = await db
-        .collection("datasets")
-        .findOne({ checksum }, { projection: { _id: 1, name: 1 } });
-      if (existing) {
-        return res.status(409).json({
-          success: false,
-          error: "This exact file has already been imported",
-          datasetId: existing._id,
-        });
-      }
-
       const now = new Date();
       const uploadedBy = new ObjectId(req.user.userId);
 
       const datasetResult = await db.collection("datasets").insertOne({
-        name: req.body.name || originalName.replace(/\.(csv|xlsx)$/i, ""),
+        name: datasetName,
         originalFileName: originalName,
         fileType,
         sheetName: null,
-        checksum,
+        checksum, // fingerprint, not used to reject
         totalRows: 0,
         importedRows: 0,
         skippedRows: 0,
+        renamedRows: 0,
+        dedupeStrategy,
         status: "pending",
         importError: null,
         importErrors: [],
+        progress: {
+          phase: "queued",
+          startedAt: now,
+          updatedAt: now,
+        },
         uploadedBy,
         assignedTo: null,
         assignedAt: null,
@@ -348,7 +534,13 @@ router.post(
         actor: req.user,
         targetType: "dataset",
         targetId: datasetId.toString(),
-        metadata: { fileName: originalName, fileType, checksum },
+        metadata: {
+          fileName: originalName,
+          fileType,
+          checksum,
+          dedupeStrategy,
+          datasetName,
+        },
       });
 
       res.status(202).json({
@@ -356,14 +548,17 @@ router.post(
         message: "Import started. Poll the dataset to track progress.",
         datasetId,
         status: "pending",
+        name: datasetName,
       });
 
+      // Fire-and-forget
       processImportInBackground({
         db,
         datasetId,
         fileBuffer: req.file.buffer,
         originalName,
         uploadedBy,
+        dedupeStrategy,
       }).catch((err) => console.error("uncaught background error:", err));
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
@@ -371,7 +566,7 @@ router.post(
   },
 );
 
-// --- Preview ---
+/* ---------- Preview ---------- */
 
 router.post(
   "/preview",
@@ -394,7 +589,8 @@ router.post(
       }
 
       const sample = [];
-      const seenSourceIds = new Set();
+      const seenSourceIds = new Map();
+      const duplicateIds = [];
       let valid = 0;
       let missingIdOrText = 0;
       let duplicates = 0;
@@ -411,14 +607,20 @@ router.post(
           missingIdOrText++;
           return;
         }
+
         if (seenSourceIds.has(sourceId)) {
           duplicates++;
+          duplicateIds.push(sourceId);
           if (previewErrors.length < 10) {
-            previewErrors.push(`Row ${idx + 2}: duplicate id "${sourceId}"`);
+            previewErrors.push(
+              `Row ${idx + 2}: duplicate id "${sourceId}" (first at row ${
+                seenSourceIds.get(sourceId) + 2
+              })`,
+            );
           }
           return;
         }
-        seenSourceIds.add(sourceId);
+        seenSourceIds.set(sourceId, idx);
         valid++;
 
         if (sample.length < 10) {
@@ -436,10 +638,7 @@ router.post(
         .update(req.file.buffer)
         .digest("hex");
 
-      const db = getDB();
-      const existingDataset = await db
-        .collection("datasets")
-        .findOne({ checksum }, { projection: { _id: 1, name: 1 } });
+      const uniqueDuplicateIds = [...new Set(duplicateIds)];
 
       res.json({
         success: true,
@@ -448,16 +647,13 @@ router.post(
           validRows: valid,
           missingIdOrText,
           duplicates,
+          uniqueDuplicateCount: uniqueDuplicateIds.length,
+          duplicateIds: uniqueDuplicateIds.slice(0, 20),
           fileName: originalName,
+          suggestedName: originalName.replace(/\.(csv|xlsx)$/i, ""),
           checksum,
           sample,
           errors: previewErrors,
-          alreadyImported: existingDataset
-            ? {
-                datasetId: existingDataset._id,
-                name: existingDataset.name,
-              }
-            : null,
         },
       });
     } catch (err) {
@@ -466,7 +662,7 @@ router.post(
   },
 );
 
-// --- Stats (dashboard) ---
+/* ---------- Stats ---------- */
 
 router.get("/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
@@ -542,7 +738,7 @@ router.get("/stats", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// --- List (with optional counts) ---
+/* ---------- List ---------- */
 
 router.get("/", verifyToken, async (req, res) => {
   try {
@@ -624,9 +820,9 @@ router.get("/", verifyToken, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Parameterized routes
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* Parameterized routes                                                */
+/* ------------------------------------------------------------------ */
 
 router.get("/:id", verifyToken, async (req, res) => {
   try {
@@ -771,9 +967,18 @@ router.post("/:id/duplicate", verifyToken, verifyAdmin, async (req, res) => {
       totalRows: source.totalRows,
       importedRows: source.importedRows,
       skippedRows: source.skippedRows,
+      renamedRows: source.renamedRows || 0,
+      dedupeStrategy: source.dedupeStrategy || "skip",
       status: "completed",
       importError: null,
       importErrors: [],
+      progress: {
+        phase: "completed",
+        processed: source.importedRows,
+        total: source.importedRows,
+        startedAt: now,
+        updatedAt: now,
+      },
       uploadedBy: userId,
       assignedTo: null,
       assignedAt: null,
