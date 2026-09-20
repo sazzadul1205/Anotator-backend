@@ -13,6 +13,11 @@ async function ensureIndexes(db) {
     db.collection("comments").createIndex({ datasetId: 1, createdAt: -1 }),
     db.collection("comments").createIndex({ assignedTo: 1 }),
     db.collection("comments").createIndex({ status: 1 }),
+    db.collection("comments").createIndex({ datasetId: 1, sentiment: 1 }),
+    db.collection("comments").createIndex({ datasetId: 1, type: 1 }),
+    db
+      .collection("comments")
+      .createIndex({ datasetId: 1, status: 1, sentiment: 1 }),
 
     // Versions
     db
