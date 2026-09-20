@@ -109,8 +109,9 @@ POST   /datasets/import
 GET    /datasets
        List datasets (newest first).
        Query filters:
-         status      (pending | processing | completed | failed)
-         uploadedBy  (userId)
+         status       (pending | processing | completed | failed)
+         uploadedBy   (userId)
+         includeCounts (true) -> adds summary { total, annotated, pending }
        Returns: { success, datasets: [...] }
 
 GET    /datasets/:id
@@ -118,6 +119,10 @@ GET    /datasets/:id
        When status = "completed", also returns summary:
          { total, pending, annotated }
        Returns: { success, dataset, summary }
+       Note: dataset.status tracks the IMPORT job only. "completed" means the
+       file finished importing - NOT that every comment is annotated. Annotation
+       progress is summary.annotated / summary.total; the UI shows "in progress"
+       for a completed import that still has pending comments.
 
 PATCH  /datasets/:id
        Admin only. Rename a dataset.
@@ -191,9 +196,24 @@ PATCH  /comments/:id/annotation
        Creates a new version with changeType "annotation".
        Returns: { success, message, version }
 
-       Note: Handled one comment at a time.
-       Bulk annotation is intentionally not exposed but code is kept
-       in the codebase for later activation.
+       Note: Handled one comment at a time from the row UI.
+
+POST   /comments/bulk-annotate
+       Apply one patch to many comments in a single call.
+       Body: { ids: [ObjectId], sentiment?, type?, annotationNote? }
+       Max 200 ids per call. At least one field must be provided.
+       Status auto-flips per comment (annotated only when BOTH sentiment and
+       type end up set). One version is written per changed comment with
+       changeType "bulk_annotation".
+       Returns: { success, message, requested, updated, skipped }
+       UI: the dataset bulk bar only stages the values - nothing is sent until
+       the user picks sentiment and/or type and presses Apply.
+
+POST   /comments/bulk-assign
+       Admin only. Assign or unassign many comments at once.
+       Body: { ids: [ObjectId], assignedTo }  (assignedTo null = unassign)
+       Max 500 ids per call.
+       Kept in the codebase, but no longer exposed by the bulk bar.
 
 ----------------------------------------
 DATA VERSIONING
@@ -219,8 +239,8 @@ Auth             : 3
 User Management  : 7
 Datasets         : 5
 Comments         : 5
-Annotation       : 1
+Annotation       : 3
 Versioning       : 2
 ----------------------------------------
-TOTAL            : 25 endpoints
+TOTAL            : 27 endpoints
 ----------------------------------------
