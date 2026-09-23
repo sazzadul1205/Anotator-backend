@@ -14,12 +14,11 @@ const client = new MongoClient(process.env.MONGO_URI, {
 let db = null;
 
 async function connectDB() {
-  if (db) return db; 
+  if (db) return db;
   try {
     await client.connect();
     await client.db("admin").command({ ping: 1 });
     console.log("✅ Connected to MongoDB");
-
     db = client.db(process.env.DB_NAME || "annotator_db");
     return db;
   } catch (error) {
@@ -28,7 +27,6 @@ async function connectDB() {
   }
 }
 
-// Synchronous getter — returns null until connectDB() has resolved.
 function getDB() {
   return db;
 }

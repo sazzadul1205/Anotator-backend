@@ -8,6 +8,7 @@ require("dotenv").config();
 const { connectDB, getDB } = require("./config/db");
 const { ensureIndexes, cleanupStaleImports } = require("./config/indexes");
 const { validateEnv } = require("./config/env");
+const { notFound, errorHandler } = require("./middleware/errorHandler");
 
 validateEnv();
 
@@ -92,27 +93,8 @@ app.use("/api/taxonomies", require("./routes/taxonomyRoute"));
 app.use("/api/audit", require("./routes/auditRoute"));
 app.use("/api/analytics", require("./routes/analyticsRoute"));
 
-// 404
-app.use((req, res) =>
-  res.status(404).json({
-    success: false,
-    error: "Route not found",
-    path: req.originalUrl,
-  }),
-);
-
-// Central error handler
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  console.error("[error]", err);
-  res.status(err.status || 500).json({
-    success: false,
-    error:
-      process.env.NODE_ENV === "production"
-        ? "Internal server error"
-        : err.message,
-  });
-});
+app.use(notFound);
+app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 let server;

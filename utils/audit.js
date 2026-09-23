@@ -1,9 +1,5 @@
-// utils/audit.js
 const { getDB } = require("../config/db");
 
-/**
- * Fire-and-forget audit log entry. Never throws into the caller.
- */
 async function audit({ action, actor, targetType, targetId, metadata = {} }) {
   try {
     const db = getDB();

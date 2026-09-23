@@ -1,4 +1,3 @@
-// config/env.js
 function validateEnv() {
   const required = ["MONGO_URI", "JWT_SECRET", "DB_NAME"];
   const missing = required.filter((k) => !process.env[k]);

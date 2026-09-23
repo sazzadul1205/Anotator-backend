@@ -42,9 +42,7 @@ async function verifyToken(req, res, next) {
       );
 
     if (!user) {
-      return res
-        .status(401)
-        .json({ success: false, error: "User not found" });
+      return res.status(401).json({ success: false, error: "User not found" });
     }
     if (!user.isActive) {
       return res
@@ -54,9 +52,7 @@ async function verifyToken(req, res, next) {
 
     const tokenVersion = payload.tokenVersion || 0;
     if ((user.tokenVersion || 0) !== tokenVersion) {
-      return res
-        .status(401)
-        .json({ success: false, error: "Token revoked" });
+      return res.status(401).json({ success: false, error: "Token revoked" });
     }
 
     req.user = {
@@ -69,9 +65,7 @@ async function verifyToken(req, res, next) {
     next();
   } catch (err) {
     console.error("[verifyToken]", err);
-    return res
-      .status(500)
-      .json({ success: false, error: "Auth check failed" });
+    return res.status(500).json({ success: false, error: "Auth check failed" });
   }
 }
 
