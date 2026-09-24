@@ -1,3 +1,4 @@
+// server.js
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -6,9 +7,11 @@ const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const { connectDB, getDB } = require("./config/db");
-const { ensureIndexes, cleanupStaleImports } = require("./config/indexes");
+const { ensureIndexes } = require("./config/indexes");
 const { validateEnv } = require("./config/env");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
+const concurrency = require("./config/concurrency");
+const { Dataset } = require("./models");
 
 validateEnv();
 
@@ -81,6 +84,10 @@ app.get("/health", async (req, res) => {
     db: dbStatus,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+    queues: {
+      imports: concurrency.imports.snapshot(),
+      exports: concurrency.exports.snapshot(),
+    },
   });
 });
 
@@ -104,7 +111,13 @@ async function start() {
   const db = getDB();
 
   await ensureIndexes(db);
-  await cleanupStaleImports(db);
+
+  // Model-owned cleanup of stale imports from a prior crash.
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000);
+  const cleaned = await Dataset.cleanupStaleImports(cutoff);
+  if (cleaned.modifiedCount > 0) {
+    console.log(`🧹 Marked ${cleaned.modifiedCount} stale imports as failed`);
+  }
 
   server = app.listen(PORT, () => {
     console.log(

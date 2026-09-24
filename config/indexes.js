@@ -1,3 +1,8 @@
+// config/indexes.js
+// Database indexes for the Mongo adapter.
+// Stale-import cleanup is owned by the Dataset model
+// (models/Dataset.js → cleanupStaleImports).
+
 async function ensureIndexes(db) {
   await Promise.all([
     db.collection("users").createIndex({ email: 1 }, { unique: true }),
@@ -39,24 +44,4 @@ async function ensureIndexes(db) {
   console.log("✅ DB indexes ensured");
 }
 
-async function cleanupStaleImports(db) {
-  const cutoff = new Date(Date.now() - 30 * 60 * 1000);
-  const result = await db.collection("datasets").updateMany(
-    {
-      status: { $in: ["pending", "processing"] },
-      updatedAt: { $lt: cutoff },
-    },
-    {
-      $set: {
-        status: "failed",
-        importError: "Server restarted during import",
-        updatedAt: new Date(),
-      },
-    },
-  );
-  if (result.modifiedCount > 0) {
-    console.log(`🧹 Marked ${result.modifiedCount} stale imports as failed`);
-  }
-}
-
-module.exports = { ensureIndexes, cleanupStaleImports };
+module.exports = { ensureIndexes };
