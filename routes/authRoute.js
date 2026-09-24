@@ -7,7 +7,7 @@ const router = express.Router();
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: process.env.NODE_ENV === "production" ? 5 : 1000,
   message: {
     success: false,
     error: "Too many login attempts. Please try again after 15 minutes.",
@@ -16,7 +16,7 @@ const loginLimiter = rateLimit({
 
 const bootstrapLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: 10,
+  max: process.env.NODE_ENV === "production" ? 10 : 1000,
   message: {
     success: false,
     error: "Too many bootstrap attempts. Try again later.",
