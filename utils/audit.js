@@ -1,11 +1,11 @@
-const { getDB } = require("../config/db");
+// utils/audit.js
+// Append one entry to the audit log. Never throws into the caller.
+
+const { AuditLog } = require("../models");
 
 async function audit({ action, actor, targetType, targetId, metadata = {} }) {
   try {
-    const db = getDB();
-    if (!db) return;
-
-    await db.collection("audit_log").insertOne({
+    await AuditLog.create({
       action,
       actorId: actor?.userId || null,
       actorEmail: actor?.email || null,

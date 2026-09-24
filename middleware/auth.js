@@ -1,6 +1,9 @@
+// middleware/auth.js
+// JWT verification + admin gate.
+// Uses the User model so this stays storage-agnostic.
+
 const jwt = require("jsonwebtoken");
-const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db");
+const { User } = require("../models");
 
 async function verifyToken(req, res, next) {
   try {
@@ -27,20 +30,7 @@ async function verifyToken(req, res, next) {
         .json({ success: false, error: "Invalid or expired token" });
     }
 
-    const db = getDB();
-    if (!db) {
-      return res
-        .status(503)
-        .json({ success: false, error: "Database not ready" });
-    }
-
-    const user = await db
-      .collection("users")
-      .findOne(
-        { _id: new ObjectId(payload.userId) },
-        { projection: { password: 0, passwordHash: 0 } },
-      );
-
+    const user = await User.findById(payload.userId);
     if (!user) {
       return res.status(401).json({ success: false, error: "User not found" });
     }
@@ -56,7 +46,7 @@ async function verifyToken(req, res, next) {
     }
 
     req.user = {
-      userId: user._id.toString(),
+      userId: user.id,
       role: user.role,
       email: user.email,
       name: user.name,
