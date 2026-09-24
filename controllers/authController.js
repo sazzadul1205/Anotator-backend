@@ -1,5 +1,12 @@
+// controllers/authController.js
+// Authentication endpoints.
+
 const authService = require("../services/authService");
 
+/**
+ * GET /api/auth/bootstrap-status
+ * Returns { adminCount } so the UI can decide whether to show setup.
+ */
 async function bootstrapStatus(req, res, next) {
   try {
     const result = await authService.getBootstrapStatus();
@@ -9,6 +16,10 @@ async function bootstrapStatus(req, res, next) {
   }
 }
 
+/**
+ * POST /api/auth/bootstrap
+ * Creates the first admin. Refuses if one already exists.
+ */
 async function bootstrap(req, res, next) {
   try {
     const result = await authService.bootstrapAdmin(req.body);
@@ -18,6 +29,10 @@ async function bootstrap(req, res, next) {
   }
 }
 
+/**
+ * POST /api/auth/login
+ * Returns { user, token }.
+ */
 async function login(req, res, next) {
   try {
     const result = await authService.login({ ...req.body, ip: req.ip });
@@ -27,6 +42,10 @@ async function login(req, res, next) {
   }
 }
 
+/**
+ * POST /api/auth/logout
+ * Invalidates the caller's current tokens.
+ */
 async function logout(req, res, next) {
   try {
     await authService.logout(req.user, req.ip);
@@ -36,6 +55,10 @@ async function logout(req, res, next) {
   }
 }
 
+/**
+ * GET /api/auth/me
+ * Returns the authenticated user (injected by auth middleware).
+ */
 async function me(req, res) {
   res.json({ success: true, user: req.user });
 }

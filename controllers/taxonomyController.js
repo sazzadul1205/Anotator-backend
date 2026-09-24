@@ -1,5 +1,12 @@
+// controllers/taxonomyController.js
+// Thin HTTP wrappers around taxonomyService.
+
 const taxonomyService = require("../services/taxonomyService");
 
+/**
+ * GET /api/taxonomies?kind=&isActive=
+ * List taxonomies, scoped by role.
+ */
 async function list(req, res, next) {
   try {
     const taxonomies = await taxonomyService.listTaxonomies(
@@ -12,6 +19,10 @@ async function list(req, res, next) {
   }
 }
 
+/**
+ * GET /api/taxonomies/defaults
+ * Built-in default label sets.
+ */
 async function getDefaults(req, res, next) {
   try {
     const defaults = await taxonomyService.getDefaults();
@@ -21,6 +32,10 @@ async function getDefaults(req, res, next) {
   }
 }
 
+/**
+ * GET /api/taxonomies/dataset/:datasetId
+ * Effective taxonomy for a dataset (custom or default).
+ */
 async function getForDataset(req, res, next) {
   try {
     const result = await taxonomyService.getForDataset(
@@ -33,6 +48,10 @@ async function getForDataset(req, res, next) {
   }
 }
 
+/**
+ * POST /api/taxonomies
+ * Create a taxonomy.
+ */
 async function create(req, res, next) {
   try {
     const result = await taxonomyService.createTaxonomy(req.body, req.user);
@@ -42,6 +61,10 @@ async function create(req, res, next) {
   }
 }
 
+/**
+ * GET /api/taxonomies/:id
+ * Fetch one taxonomy.
+ */
 async function getOne(req, res, next) {
   try {
     const taxonomy = await taxonomyService.getTaxonomy(req.params.id, req.user);
@@ -51,6 +74,10 @@ async function getOne(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/taxonomies/:id
+ * Partial update (name, description, isActive, sentiment, type).
+ */
 async function update(req, res, next) {
   try {
     const result = await taxonomyService.updateTaxonomy(
@@ -64,6 +91,10 @@ async function update(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/taxonomies/:id?hard=true
+ * Soft-delete by default; hard delete only if no datasets reference it.
+ */
 async function remove(req, res, next) {
   try {
     const hard = req.query.hard === "true";
@@ -78,6 +109,10 @@ async function remove(req, res, next) {
   }
 }
 
+/**
+ * POST /api/taxonomies/:id/datasets/:datasetId/assign
+ * Attach a taxonomy to a dataset.
+ */
 async function assignToDataset(req, res, next) {
   try {
     const result = await taxonomyService.assignToDataset(
@@ -91,6 +126,10 @@ async function assignToDataset(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/taxonomies/:id/datasets/:datasetId/unassign
+ * Remove the taxonomy from a dataset.
+ */
 async function unassignFromDataset(req, res, next) {
   try {
     const result = await taxonomyService.unassignFromDataset(

@@ -1,5 +1,12 @@
+// controllers/userController.js
+// Thin HTTP wrappers around userService.
+
 const userService = require("../services/userService");
 
+/**
+ * GET /api/users
+ * List all users (admin only — enforced at route layer).
+ */
 async function list(req, res, next) {
   try {
     const users = await userService.listUsers();
@@ -9,6 +16,10 @@ async function list(req, res, next) {
   }
 }
 
+/**
+ * POST /api/users
+ * Create a user.
+ */
 async function create(req, res, next) {
   try {
     const result = await userService.createUser(req.body, req.user);
@@ -18,6 +29,10 @@ async function create(req, res, next) {
   }
 }
 
+/**
+ * GET /api/users/:id
+ * Fetch one user.
+ */
 async function getOne(req, res, next) {
   try {
     const user = await userService.getUser(req.params.id);
@@ -27,6 +42,10 @@ async function getOne(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/users/:id
+ * Update a user's name and/or email.
+ */
 async function update(req, res, next) {
   try {
     const result = await userService.updateUser(
@@ -40,6 +59,10 @@ async function update(req, res, next) {
   }
 }
 
+/**
+ * POST /api/users/:id/toggle-status
+ * Flip the user's isActive flag.
+ */
 async function toggleStatus(req, res, next) {
   try {
     const result = await userService.toggleStatus(
@@ -53,6 +76,10 @@ async function toggleStatus(req, res, next) {
   }
 }
 
+/**
+ * POST /api/users/:id/reset-password
+ * Reset a user's password (admin action).
+ */
 async function resetPassword(req, res, next) {
   try {
     const result = await userService.resetPassword(
@@ -66,6 +93,10 @@ async function resetPassword(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/users/:id
+ * Delete a user (refuses if the user still owns datasets).
+ */
 async function remove(req, res, next) {
   try {
     const result = await userService.deleteUser(
