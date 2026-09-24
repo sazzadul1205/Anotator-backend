@@ -26,3 +26,4 @@ build/
 coverage/
 
 /Build-Docs
+/tests/results
