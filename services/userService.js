@@ -1,7 +1,8 @@
+// services/userService.js
+// Admin operations on users.
+
 const bcrypt = require("bcryptjs");
-const { ObjectId } = require("mongodb");
-const User = require("../models/User");
-const Dataset = require("../models/Dataset");
+const { User, Dataset } = require("../models");
 const { audit } = require("../utils/audit");
 
 async function listUsers() {
@@ -26,7 +27,7 @@ async function createUser({ name, email, password, role }, actor) {
   }
 
   const normalizedEmail = email.toLowerCase().trim();
-  const existing = await User.findByEmail(normalizedEmail);
+  const existing = await User.findOne({ email: normalizedEmail });
   if (existing) {
     const err = new Error("User already exists");
     err.status = 400;
@@ -35,16 +36,16 @@ async function createUser({ name, email, password, role }, actor) {
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  let userId;
+  let created;
   try {
-    userId = await User.create({
+    created = await User.create({
       name: name.trim(),
       email: normalizedEmail,
       password: hashedPassword,
       role,
     });
   } catch (err) {
-    if (err.code === 11000) {
+    if (err.name === "DuplicateKeyError") {
       const e = new Error("User already exists");
       e.status = 400;
       throw e;
@@ -56,11 +57,11 @@ async function createUser({ name, email, password, role }, actor) {
     action: "user.create",
     actor,
     targetType: "user",
-    targetId: userId.toString(),
+    targetId: created.id,
     metadata: { email: normalizedEmail, role },
   });
 
-  return { userId, message: "User created successfully" };
+  return { userId: created.id, message: "User created successfully" };
 }
 
 async function getUser(id) {
@@ -91,11 +92,8 @@ async function updateUser(id, { name, email }, actor) {
   if (name) updates.name = name.trim();
   if (email) {
     const normalizedEmail = email.toLowerCase().trim();
-    const existing = await User.collection().findOne({
-      email: normalizedEmail,
-      _id: { $ne: new ObjectId(id) },
-    });
-    if (existing) {
+    const existing = await User.findOne({ email: normalizedEmail });
+    if (existing && existing.id !== id) {
       const err = new Error("Email already exists");
       err.status = 400;
       throw err;

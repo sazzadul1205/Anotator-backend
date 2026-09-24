@@ -1,17 +1,12 @@
-const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db");
-const Dataset = require("../models/Dataset");
-const Comment = require("../models/Comment");
-const CommentVersion = require("../models/CommentVersion");
-const User = require("../models/User");
+// services/analyticsService.js
+// Dataset-level and global analytics.
 
-function toObjectId(id) {
-  try {
-    return new ObjectId(id);
-  } catch {
-    return null;
-  }
-}
+const { Comment, CommentVersion, Dataset, User } = require("../models");
+const { exports: exportQueue } = require("../config/concurrency");
+
+// ---------------------------------------------------------------------------
+// Pure statistical helpers
+// ---------------------------------------------------------------------------
 
 function shannonEntropy(counts) {
   const total = counts.reduce((a, b) => a + b, 0);
@@ -36,8 +31,12 @@ function giniImpurity(counts) {
   return 1 - s;
 }
 
-function summarizeDistribution(countMap) {
-  const entries = Object.entries(countMap).sort((a, b) => b[1] - a[1]);
+function summarizeDistribution(rows) {
+  const entries = rows
+    .filter((r) => r && r.label !== null)
+    .map((r) => [String(r.label), Number(r.count) || 0])
+    .sort((a, b) => b[1] - a[1]);
+
   const counts = entries.map(([, c]) => c);
   const total = counts.reduce((a, b) => a + b, 0);
   const max = counts[0] || 0;
@@ -75,7 +74,11 @@ function assessReadiness({
   let score = 100;
 
   if (totalComments === 0) {
-    return { level: "empty", score: 0, reasons: ["Dataset has no comments."] };
+    return {
+      level: "empty",
+      score: 0,
+      reasons: ["Dataset has no comments."],
+    };
   }
 
   const annotatedPct = (annotatedComments / totalComments) * 100;
@@ -154,149 +157,94 @@ function assessReadiness({
   else if (score >= 30) level = "needs_work";
   else level = "not_ready";
 
-  if (reasons.length === 0)
+  if (reasons.length === 0) {
     reasons.push("Looks good — no obvious issues detected.");
+  }
 
   return { level, score, reasons };
 }
 
-async function getDatasetAnalytics(datasetId, user) {
-  const db = getDB();
-  const id = toObjectId(datasetId);
-  if (!id) {
-    const err = new Error("Invalid datasetId");
-    err.status = 400;
-    throw err;
-  }
+// ---------------------------------------------------------------------------
+// Domain helpers
+// ---------------------------------------------------------------------------
 
-  const dataset = await Dataset.findById(id);
+const LENGTH_BOUNDARIES = [0, 20, 50, 100, 200, 500, 1000, 100000];
+
+function countNearDuplicates(texts) {
+  const seen = new Set();
+  let dup = 0;
+  for (const t of texts) {
+    const key = String(t || "")
+      .toLowerCase()
+      .trim()
+      .slice(0, 80);
+    if (!key) continue;
+    if (seen.has(key)) dup++;
+    else seen.add(key);
+  }
+  return dup;
+}
+
+async function assertDatasetAccess(datasetId, user) {
+  const dataset = await Dataset.findById(datasetId);
   if (!dataset) {
     const err = new Error("Dataset not found");
     err.status = 404;
     throw err;
   }
-
-  if (
-    user.role !== "admin" &&
-    (!dataset.assignedTo || dataset.assignedTo.toString() !== user.userId)
-  ) {
+  if (user.role !== "admin" && dataset.assignedTo !== user.userId) {
     const err = new Error("Not assigned to you");
     err.status = 403;
     throw err;
   }
+  return dataset;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+async function getDatasetAnalytics(datasetId, user) {
+  const dataset = await assertDatasetAccess(datasetId, user);
 
   const [
-    totalComments,
-    annotatedComments,
-    pendingComments,
-    sentimentAgg,
-    typeAgg,
-    lengthAgg,
-    statusAgg,
-    versionAgg,
-    sampleComments,
+    statusCounts,
+    sentimentRows,
+    typeRows,
+    lengthRows,
+    statusRows,
+    versionActivity,
+    duplicateTexts,
   ] = await Promise.all([
-    Comment.count({ datasetId: id }),
-    Comment.count({ datasetId: id, status: "annotated" }),
-    Comment.count({ datasetId: id, status: "pending" }),
-    Comment.aggregate([
-      { $match: { datasetId: id } },
-      { $group: { _id: "$sentiment", count: { $sum: 1 } } },
-    ]),
-    Comment.aggregate([
-      { $match: { datasetId: id } },
-      { $group: { _id: "$type", count: { $sum: 1 } } },
-    ]),
-    Comment.aggregate([
-      { $match: { datasetId: id } },
-      { $project: { len: { $strLenCP: { $ifNull: ["$commentText", ""] } } } },
-      {
-        $bucket: {
-          groupBy: "$len",
-          boundaries: [0, 20, 50, 100, 200, 500, 1000, 100000],
-          default: "1000+",
-          output: { count: { $sum: 1 } },
-        },
-      },
-    ]),
-    Comment.aggregate([
-      { $match: { datasetId: id } },
-      { $group: { _id: "$status", count: { $sum: 1 } } },
-    ]),
-    db
-      .collection("comment_versions")
-      .aggregate([
-        {
-          $lookup: {
-            from: "comments",
-            localField: "commentId",
-            foreignField: "_id",
-            as: "c",
-          },
-        },
-        { $unwind: "$c" },
-        { $match: { "c.datasetId": id } },
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-            count: { $sum: 1 },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ])
-      .toArray(),
-    Comment.find(
-      { datasetId: id },
-      { projection: { commentText: 1 }, limit: 2000 },
-    ),
+    Comment.countByStatus(datasetId),
+    Comment.groupByField(datasetId, "sentiment"),
+    Comment.groupByField(datasetId, "type"),
+    Comment.lengthHistogram(datasetId, LENGTH_BOUNDARIES),
+    Comment.groupByField(datasetId, "status"),
+    CommentVersion.activityByDateForDataset(datasetId),
+    Comment.findTextsForDuplicates(datasetId, 2000),
   ]);
 
-  const sentimentMap = {};
-  sentimentAgg.forEach((r) => {
-    sentimentMap[r._id || "unannotated"] = r.count;
-  });
-  const typeMap = {};
-  typeAgg.forEach((r) => {
-    typeMap[r._id || "unclassified"] = r.count;
-  });
+  const {
+    total: totalComments,
+    pending: pendingComments,
+    annotated: annotatedComments,
+  } = statusCounts;
+
+  const sentimentSummary = summarizeDistribution(sentimentRows);
+  const typeSummary = summarizeDistribution(typeRows);
+
+  const lengthHistogram = lengthRows.map((r) => ({
+    label: r.label,
+    count: r.count,
+  }));
+
   const statusMap = {};
-  statusAgg.forEach((r) => {
-    statusMap[r._id || "unknown"] = r.count;
-  });
-
-  const sentimentSummary = summarizeDistribution(sentimentMap);
-  const typeSummary = summarizeDistribution(typeMap);
-
-  const lengthBinLabels = {
-    0: "0–19",
-    20: "20–49",
-    50: "50–99",
-    100: "100–199",
-    200: "200–499",
-    500: "500–999",
-    1000: "1000+",
-  };
-  const lengthBuckets = {};
-  lengthAgg.forEach((b) => {
-    const label =
-      b._id === "1000+" ? "1000+" : lengthBinLabels[b._id] || String(b._id);
-    lengthBuckets[label] = b.count;
-  });
-  const lengthHistogram = Object.entries(lengthBuckets).map(
-    ([label, count]) => ({ label, count }),
-  );
-
-  const seen = new Map();
-  let duplicateCount = 0;
-  for (const c of sampleComments) {
-    const key = String(c.commentText || "")
-      .toLowerCase()
-      .trim()
-      .slice(0, 80);
-    if (!key) continue;
-    if (seen.has(key)) duplicateCount++;
-    else seen.set(key, 1);
+  for (const r of statusRows) {
+    statusMap[r.label || "unknown"] = r.count;
   }
+
+  const duplicateCount = countNearDuplicates(duplicateTexts);
 
   const readiness = assessReadiness({
     totalComments,
@@ -307,6 +255,7 @@ async function getDatasetAnalytics(datasetId, user) {
   });
 
   const warnings = [];
+
   if (sentimentSummary.imbalanceRatio && sentimentSummary.imbalanceRatio >= 3) {
     const top = sentimentSummary.distribution[0];
     const bottom =
@@ -344,7 +293,7 @@ async function getDatasetAnalytics(datasetId, user) {
 
   return {
     dataset: {
-      _id: dataset._id,
+      _id: dataset.id,
       name: dataset.name,
       status: dataset.status,
       taxonomyId: dataset.taxonomyId || null,
@@ -364,14 +313,13 @@ async function getDatasetAnalytics(datasetId, user) {
     sentiment: sentimentSummary,
     type: typeSummary,
     lengthHistogram,
-    activity: versionAgg.map((r) => ({ date: r._id, count: r.count })),
+    activity: versionActivity,
     readiness,
     warnings,
   };
 }
 
 async function getGlobalAnalytics() {
-  const db = getDB();
   const now = new Date();
   const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
 
@@ -382,10 +330,10 @@ async function getGlobalAnalytics() {
     totalDatasets,
     totalUsers,
     activeUsers,
-    sentimentAgg,
-    typeAgg,
-    versionsOverTime,
-    datasetsByStatus,
+    sentimentRows,
+    typeRows,
+    versionActivity,
+    datasetStatusRows,
     topDatasets,
   ] = await Promise.all([
     Comment.count({}),
@@ -394,72 +342,27 @@ async function getGlobalAnalytics() {
     Dataset.countAll(),
     User.countAll(),
     User.countActive(),
-    Comment.aggregate([{ $group: { _id: "$sentiment", count: { $sum: 1 } } }]),
-    Comment.aggregate([{ $group: { _id: "$type", count: { $sum: 1 } } }]),
-    CommentVersion.activityByDate({ createdAt: { $gte: fourteenDaysAgo } }),
+    Comment.groupByField(null, "sentiment"),
+    Comment.groupByField(null, "type"),
+    CommentVersion.activityByDate(fourteenDaysAgo),
     Dataset.countByStatus(),
-    db
-      .collection("datasets")
-      .aggregate([
-        {
-          $lookup: {
-            from: "comments",
-            let: { dsId: "$_id" },
-            pipeline: [
-              { $match: { $expr: { $eq: ["$datasetId", "$$dsId"] } } },
-              {
-                $group: {
-                  _id: null,
-                  total: { $sum: 1 },
-                  annotated: {
-                    $sum: { $cond: [{ $eq: ["$status", "annotated"] }, 1, 0] },
-                  },
-                },
-              },
-            ],
-            as: "counts",
-          },
-        },
-        {
-          $addFields: {
-            summary: {
-              $ifNull: [
-                { $arrayElemAt: ["$counts", 0] },
-                { total: 0, annotated: 0 },
-              ],
-            },
-          },
-        },
-        { $match: { "summary.total": { $gt: 0 } } },
-        { $sort: { "summary.total": -1 } },
-        { $limit: 10 },
-        {
-          $project: {
-            name: 1,
-            status: 1,
-            total: "$summary.total",
-            annotated: "$summary.annotated",
-          },
-        },
-      ])
-      .toArray(),
+    Dataset.topByCommentCount(10),
   ]);
 
-  const sentimentMap = {};
-  sentimentAgg.forEach((r) => {
-    sentimentMap[r._id || "unannotated"] = r.count;
-  });
-  const typeMap = {};
-  typeAgg.forEach((r) => {
-    typeMap[r._id || "unclassified"] = r.count;
-  });
+  const sentimentSummary = summarizeDistribution(sentimentRows);
+  const typeSummary = summarizeDistribution(typeRows);
 
+  const activityByDate = new Map(versionActivity.map((v) => [v.date, v.count]));
   const timeline = [];
   for (let i = 13; i >= 0; i--) {
     const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
     const key = d.toISOString().slice(0, 10);
-    const found = versionsOverTime.find((v) => v._id === key);
-    timeline.push({ date: key, count: found ? found.count : 0 });
+    timeline.push({ date: key, count: activityByDate.get(key) || 0 });
+  }
+
+  const datasetsByStatus = {};
+  for (const row of datasetStatusRows) {
+    datasetsByStatus[row.status || "unknown"] = row.count;
   }
 
   return {
@@ -475,15 +378,12 @@ async function getGlobalAnalytics() {
           ? 0
           : Math.round((annotatedComments / totalComments) * 1000) / 10,
     },
-    sentiment: summarizeDistribution(sentimentMap),
-    type: summarizeDistribution(typeMap),
+    sentiment: sentimentSummary,
+    type: typeSummary,
     activityLast14Days: timeline,
-    datasetsByStatus: datasetsByStatus.reduce((acc, r) => {
-      acc[r._id || "unknown"] = r.count;
-      return acc;
-    }, {}),
+    datasetsByStatus,
     topDatasets: topDatasets.map((d) => ({
-      _id: d._id,
+      _id: d.id,
       name: d.name,
       status: d.status,
       total: d.total,
@@ -494,9 +394,145 @@ async function getGlobalAnalytics() {
   };
 }
 
+/**
+ * Build an ML-ready export of annotated comments for one dataset.
+ * Returns { contentType, filename, body }.
+ */
+async function _exportMLDataset({ datasetId, user, format, split }) {
+  if (!["jsonl", "csv", "xlsx"].includes(format)) {
+    const err = new Error("format must be jsonl, csv or xlsx");
+    err.status = 400;
+    throw err;
+  }
+
+  const dataset = await assertDatasetAccess(datasetId, user);
+
+  const splitStr = String(split || "0.8,0.1,0.1");
+  const [trainP, valP, testP] = splitStr.split(",").map(Number);
+  if (
+    !Number.isFinite(trainP) ||
+    !Number.isFinite(valP) ||
+    !Number.isFinite(testP) ||
+    Math.abs(trainP + valP + testP - 1) > 1e-6
+  ) {
+    const err = new Error(
+      "split must be three numbers summing to 1 (e.g. 0.8,0.1,0.1)",
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const { comments } = await Comment.findMany(
+    { datasetId, status: "annotated" },
+    { page: 1, limit: 1_000_000, sortBy: "createdAt", sortDir: "asc" },
+  );
+
+  if (comments.length === 0) {
+    const err = new Error("No annotated comments to export");
+    err.status = 400;
+    throw err;
+  }
+
+  const sorted = comments
+    .slice()
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+  const n = sorted.length;
+  const nTrain = Math.floor(n * trainP);
+  const nVal = Math.floor(n * valP);
+  const trainIds = new Set(sorted.slice(0, nTrain).map((c) => c.id));
+  const valIds = new Set(sorted.slice(nTrain, nTrain + nVal).map((c) => c.id));
+
+  const splitFor = (c) =>
+    trainIds.has(c.id) ? "train" : valIds.has(c.id) ? "val" : "test";
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const baseName = String(dataset.name)
+    .replace(/[^\w-]+/g, "_")
+    .slice(0, 40);
+
+  if (format === "jsonl") {
+    const lines = sorted.map((c) =>
+      JSON.stringify({
+        id: c.sourceId,
+        text: c.commentText,
+        sentiment: c.sentiment,
+        type: c.type,
+        split: splitFor(c),
+        dataset: dataset.name,
+        taxonomy: dataset.taxonomyName || "Default",
+      }),
+    );
+    return {
+      contentType: "application/x-ndjson; charset=utf-8",
+      filename: `${baseName}-ml-${timestamp}.jsonl`,
+      body: lines.join("\n") + "\n",
+    };
+  }
+
+  const header = [
+    "id",
+    "text",
+    "sentiment",
+    "type",
+    "split",
+    "dataset",
+    "taxonomy",
+  ];
+  const rows = sorted.map((c) => [
+    c.sourceId,
+    c.commentText,
+    c.sentiment,
+    c.type,
+    splitFor(c),
+    dataset.name,
+    dataset.taxonomyName || "Default",
+  ]);
+
+  if (format === "csv") {
+    const escapeCsv = (v) => {
+      let s = v === null || v === undefined ? "" : String(v);
+      if (/^[=+\-@]/.test(s)) s = "'" + s;
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      header.join(","),
+      ...rows.map((r) => r.map(escapeCsv).join(",")),
+    ];
+    return {
+      contentType: "text/csv; charset=utf-8",
+      filename: `${baseName}-ml-${timestamp}.csv`,
+      body: "\uFEFF" + lines.join("\r\n"),
+    };
+  }
+
+  const ExcelJS = require("exceljs");
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("ml-data");
+  sheet.addRow(header);
+  rows.forEach((r) => sheet.addRow(r));
+  const buffer = await workbook.xlsx.writeBuffer();
+
+  return {
+    contentType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    filename: `${baseName}-ml-${timestamp}.xlsx`,
+    body: Buffer.from(buffer),
+  };
+}
+
+/**
+ * Public entry — queued so concurrency is bounded by MAX_CONCURRENT_EXPORTS.
+ */
+function exportMLDataset(args) {
+  return exportQueue.run(() => _exportMLDataset(args));
+}
+
 module.exports = {
   summarizeDistribution,
   assessReadiness,
   getDatasetAnalytics,
   getGlobalAnalytics,
+  exportMLDataset,
 };

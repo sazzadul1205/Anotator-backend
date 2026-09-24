@@ -1,10 +1,16 @@
+// services/importService.js
+// Parse CSV/XLSX, preview, create dataset records, run import in background.
+
 const crypto = require("crypto");
 const { parse } = require("csv-parse/sync");
 const ExcelJS = require("exceljs");
-const { getDB } = require("../config/db");
-const Dataset = require("../models/Dataset");
-const Comment = require("../models/Comment");
-const CommentVersion = require("../models/CommentVersion");
+const { Dataset, Comment, CommentVersion, Taxonomy } = require("../models");
+const { audit } = require("../utils/audit");
+const { imports: importQueue } = require("../config/concurrency");
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
 
 function cellToString(value) {
   if (value === null || value === undefined) return "";
@@ -83,9 +89,12 @@ function normalizeRow(row) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Preview
+// ---------------------------------------------------------------------------
+
 async function previewFile(fileBuffer, originalName) {
   const { rows } = await parseFile(fileBuffer, originalName);
-
   if (!rows.length) {
     const err = new Error("File is empty");
     err.status = 400;
@@ -153,6 +162,10 @@ async function previewFile(fileBuffer, originalName) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Dataset record
+// ---------------------------------------------------------------------------
+
 async function createDatasetRecord({
   name,
   originalFileName,
@@ -164,7 +177,7 @@ async function createDatasetRecord({
   uploadedBy,
 }) {
   const now = new Date();
-  const datasetId = await Dataset.create({
+  const { id } = await Dataset.create({
     name,
     originalFileName,
     fileType,
@@ -186,36 +199,101 @@ async function createDatasetRecord({
     assignedTo: null,
     assignedAt: null,
   });
-  return datasetId;
+  return id;
 }
 
-async function processImportInBackground({
+// ---------------------------------------------------------------------------
+// Start import (used by datasetController)
+// ---------------------------------------------------------------------------
+
+async function startImport({
+  fileBuffer,
+  originalName,
+  fileType,
+  datasetName,
+  dedupeStrategy,
+  taxonomyId: rawTaxonomyId,
+  uploadedBy,
+  actor,
+}) {
+  let taxonomyId = null;
+  let taxonomyName = null;
+  if (rawTaxonomyId) {
+    const tax = await Taxonomy.findById(rawTaxonomyId);
+    if (!tax || !tax.isActive) {
+      const err = new Error("Taxonomy not found or inactive");
+      err.status = 404;
+      throw err;
+    }
+    taxonomyId = tax.id;
+    taxonomyName = tax.name;
+  }
+
+  const checksum = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+
+  const datasetId = await createDatasetRecord({
+    name: datasetName,
+    originalFileName: originalName,
+    fileType,
+    checksum,
+    dedupeStrategy,
+    taxonomyId,
+    taxonomyName,
+    uploadedBy,
+  });
+
+  await audit({
+    action: "dataset.import_started",
+    actor,
+    targetType: "dataset",
+    targetId: datasetId,
+    metadata: {
+      fileName: originalName,
+      fileType,
+      checksum,
+      dedupeStrategy,
+      datasetName,
+      taxonomyId,
+      taxonomyName,
+    },
+  });
+
+  return { datasetId, name: datasetName, taxonomyId, taxonomyName };
+}
+
+// ---------------------------------------------------------------------------
+// Queue helpers — used by the controller to reject early when full
+// ---------------------------------------------------------------------------
+
+function canAcceptImport() {
+  return importQueue.pending < importQueue.maxQueueSize;
+}
+
+function importQueueSnapshot() {
+  return importQueue.snapshot();
+}
+
+// ---------------------------------------------------------------------------
+// Background import (queued)
+// ---------------------------------------------------------------------------
+
+/**
+ * The actual import worker. Runs inside the concurrency queue.
+ * Do NOT call this directly — call `processImportInBackground` instead.
+ */
+async function _processImportInBackground({
   datasetId,
   fileBuffer,
   originalName,
   uploadedBy,
   dedupeStrategy = "skip",
 }) {
-  const db = getDB();
   const startedAt = new Date();
   const CHUNK_SIZE = 1000;
 
-  const setProgress = async (patch) => {
-    await Dataset.updateProgress(datasetId, patch);
-  };
-
-  const bumpProcessed = async (processed) => {
-    await db.collection("datasets").updateOne(
-      { _id: datasetId },
-      {
-        $set: {
-          "progress.processed": processed,
-          "progress.updatedAt": new Date(),
-          updatedAt: new Date(),
-        },
-      },
-    );
-  };
+  const setProgress = (patch) => Dataset.updateProgress(datasetId, patch);
+  const bumpProcessed = (processed) =>
+    Dataset.setProgressProcessed(datasetId, processed);
 
   try {
     await setProgress({ phase: "parsing", startedAt });
@@ -317,19 +395,13 @@ async function processImportInBackground({
     });
 
     if (commentsToInsert.length === 0) {
-      await db.collection("datasets").updateOne(
-        { _id: datasetId },
-        {
-          $set: {
-            status: "failed",
-            skippedRows: skipped,
-            importError: "No valid rows found",
-            importErrors: errors.slice(0, 20),
-            progress: { phase: "failed", updatedAt: new Date() },
-            updatedAt: new Date(),
-          },
-        },
-      );
+      await Dataset.updateById(datasetId, {
+        status: "failed",
+        skippedRows: skipped,
+        importError: "No valid rows found",
+        importErrors: errors.slice(0, 20),
+        progress: { phase: "failed", updatedAt: new Date() },
+      });
       return;
     }
 
@@ -342,29 +414,15 @@ async function processImportInBackground({
     });
 
     const insertedPairs = [];
-
     for (let i = 0; i < commentsToInsert.length; i += CHUNK_SIZE) {
       const chunk = commentsToInsert.slice(i, i + CHUNK_SIZE);
-      let chunkResult;
-
-      try {
-        chunkResult = await Comment.insertMany(chunk, { ordered: false });
-      } catch (err) {
-        chunkResult = err.result || { insertedIds: {} };
-        if (err.writeErrors) {
-          err.writeErrors.slice(0, 5).forEach((we) => {
-            errors.push(
-              `Insert: ${we.err?.errmsg || we.errmsg || "duplicate"}`,
-            );
-          });
-        }
+      const inserted = await Comment.insertMany(chunk);
+      for (const ins of inserted) {
+        insertedPairs.push({
+          commentId: ins.id,
+          originalIndex: i + ins.index,
+        });
       }
-
-      const idsMap = chunkResult.insertedIds || {};
-      for (const [localIdx, commentId] of Object.entries(idsMap)) {
-        insertedPairs.push({ commentId, originalIndex: i + Number(localIdx) });
-      }
-
       await bumpProcessed(Math.min(i + CHUNK_SIZE, totalToInsert));
     }
 
@@ -416,28 +474,22 @@ async function processImportInBackground({
     const actuallyInserted = insertedPairs.length;
     const failedInserts = commentsToInsert.length - actuallyInserted;
 
-    await db.collection("datasets").updateOne(
-      { _id: datasetId },
-      {
-        $set: {
-          sheetName,
-          totalRows: rows.length,
-          importedRows: actuallyInserted,
-          skippedRows: skipped + failedInserts,
-          renamedRows: renamed,
-          status: "completed",
-          importErrors: errors.slice(0, 20),
-          progress: {
-            phase: "completed",
-            processed: totalToInsert,
-            total: totalToInsert,
-            startedAt,
-            updatedAt: new Date(),
-          },
-          updatedAt: new Date(),
-        },
+    await Dataset.updateById(datasetId, {
+      sheetName,
+      totalRows: rows.length,
+      importedRows: actuallyInserted,
+      skippedRows: skipped + failedInserts,
+      renamedRows: renamed,
+      status: "completed",
+      importErrors: errors.slice(0, 20),
+      progress: {
+        phase: "completed",
+        processed: totalToInsert,
+        total: totalToInsert,
+        startedAt,
+        updatedAt: new Date(),
       },
-    );
+    });
 
     console.log(
       `dataset ${datasetId} completed in ${Date.now() - startedAt.getTime()}ms ` +
@@ -445,18 +497,20 @@ async function processImportInBackground({
     );
   } catch (err) {
     console.error(`dataset ${datasetId} failed:`, err.message);
-    await db.collection("datasets").updateOne(
-      { _id: datasetId },
-      {
-        $set: {
-          status: "failed",
-          importError: err.message,
-          progress: { phase: "failed", updatedAt: new Date() },
-          updatedAt: new Date(),
-        },
-      },
-    );
+    await Dataset.updateById(datasetId, {
+      status: "failed",
+      importError: err.message,
+      progress: { phase: "failed", updatedAt: new Date() },
+    });
   }
+}
+
+/**
+ * Public entry point. Enqueues the import job so concurrency is
+ * bounded by MAX_CONCURRENT_IMPORTS. Rejects if the queue is full.
+ */
+function processImportInBackground(args) {
+  return importQueue.run(() => _processImportInBackground(args));
 }
 
 module.exports = {
@@ -464,5 +518,8 @@ module.exports = {
   normalizeRow,
   previewFile,
   createDatasetRecord,
+  startImport,
   processImportInBackground,
+  canAcceptImport,
+  importQueueSnapshot,
 };

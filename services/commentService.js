@@ -1,70 +1,50 @@
-const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db");
-const Comment = require("../models/Comment");
-const CommentVersion = require("../models/CommentVersion");
-const Dataset = require("../models/Dataset");
-const Taxonomy = require("../models/Taxonomy");
+// services/commentService.js
+// Business logic for comments: list, create, annotate, bulk ops,
+// version history, restore, delete.
+//
+// Storage-agnostic. All DB access via models.
+
+const {
+  Comment,
+  CommentVersion,
+  Dataset,
+  Taxonomy,
+  User,
+} = require("../models");
 const { audit } = require("../utils/audit");
+const { exports: exportQueue } = require("../config/concurrency");
 
-function toObjectId(id) {
-  try {
-    return new ObjectId(id);
-  } catch {
-    return null;
-  }
-}
+const DEFAULT_SENTIMENTS = ["positive", "negative", "neutral", "unannotated"];
+const DEFAULT_TYPES = ["bangla", "english", "banglish", "unclassified"];
 
-function escapeRegex(str) {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+// ---------------------------------------------------------------------------
+// Domain helpers
+// ---------------------------------------------------------------------------
 
-function buildFilter(query) {
+function buildDomainFilter(query) {
   const filter = {};
-
-  if (query.datasetId) {
-    const dsId = toObjectId(query.datasetId);
-    if (dsId) filter.datasetId = dsId;
-  }
+  if (query.datasetId) filter.datasetId = query.datasetId;
   if (query.sentiment) filter.sentiment = query.sentiment;
   if (query.type) filter.type = query.type;
-  if (query.assignedTo) {
-    const uid = toObjectId(query.assignedTo);
-    if (uid) filter.assignedTo = uid;
-  }
+  if (query.assignedTo) filter.assignedTo = query.assignedTo;
+
   if (query.status) {
     filter.status = query.status;
   } else if (query.hideAnnotated === "true") {
-    filter.status = { $ne: "annotated" };
+    filter.excludeAnnotated = true;
   }
+
   if (query.search && typeof query.search === "string") {
     const trimmed = query.search.trim().slice(0, 100);
-    if (trimmed) {
-      filter.commentText = { $regex: escapeRegex(trimmed), $options: "i" };
-    }
+    if (trimmed) filter.search = trimmed;
   }
+
   return filter;
 }
 
-async function getAllowedDatasetIds(user) {
-  if (user.role === "admin") return null;
-  const db = getDB();
-  const datasets = await db
-    .collection("datasets")
-    .find({ assignedTo: new ObjectId(user.userId) }, { projection: { _id: 1 } })
-    .toArray();
-  return datasets.map((d) => d._id);
-}
-
-async function assertCanAccessComment(comment, user) {
-  if (user.role === "admin") return true;
-  const dataset = await Dataset.findById(comment.datasetId);
-  if (!dataset?.assignedTo) return false;
-  return dataset.assignedTo.toString() === user.userId;
-}
-
 async function getValidOptionsForDataset(dataset) {
-  let sentiment = new Set(["positive", "negative", "neutral", "unannotated"]);
-  let type = new Set(["bangla", "english", "banglish", "unclassified"]);
+  let sentiment = new Set(DEFAULT_SENTIMENTS);
+  let type = new Set(DEFAULT_TYPES);
 
   if (dataset && dataset.taxonomyId) {
     const taxonomy = await Taxonomy.findById(dataset.taxonomyId);
@@ -84,34 +64,58 @@ async function getValidOptionsForDataset(dataset) {
   return { sentiment, type };
 }
 
+async function getAllowedDatasetIds(user) {
+  if (user.role === "admin") return null;
+  return Dataset.findAssignedToIds(user.userId);
+}
+
+async function assertCanAccessComment(comment, user) {
+  if (user.role === "admin") return;
+  const dataset = await Dataset.findById(comment.datasetId);
+  if (!dataset || dataset.assignedTo !== user.userId) {
+    const err = new Error("Not assigned to you");
+    err.status = 403;
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 async function listComments(query, user) {
   const page = parseInt(query.page, 10) || 1;
   const limit = Math.min(parseInt(query.limit, 10) || 50, 200);
-  const skip = (page - 1) * limit;
 
-  const filter = buildFilter(query);
+  const filter = buildDomainFilter(query);
 
   const allowedIds = await getAllowedDatasetIds(user);
   if (allowedIds !== null) {
     if (filter.datasetId) {
-      if (!allowedIds.some((id) => id.equals(filter.datasetId))) {
+      if (!allowedIds.includes(filter.datasetId)) {
         const err = new Error("Not assigned to you");
         err.status = 403;
         throw err;
       }
     } else {
-      filter.datasetId = { $in: allowedIds };
+      filter.datasetIds = allowedIds;
     }
   }
 
-  const total = await Comment.count(filter);
-  const comments = await Comment.find(filter, {
-    sort: { createdAt: -1 },
-    skip,
+  const { comments, total } = await Comment.findMany(filter, {
+    page,
     limit,
+    sortBy: "createdAt",
+    sortDir: "desc",
   });
 
-  return { page, limit, total, totalPages: Math.ceil(total / limit), comments };
+  return {
+    page,
+    limit,
+    total,
+    totalPages: Math.ceil(total / limit),
+    comments,
+  };
 }
 
 async function createComment(
@@ -124,33 +128,24 @@ async function createComment(
     throw err;
   }
 
-  const dsId = toObjectId(datasetId);
-  if (!dsId) {
-    const err = new Error("Invalid datasetId");
-    err.status = 400;
-    throw err;
-  }
-
-  const dataset = await Dataset.findById(dsId);
+  const dataset = await Dataset.findById(datasetId);
   if (!dataset) {
     const err = new Error("Dataset not found");
     err.status = 404;
     throw err;
   }
 
-  if (user.role !== "admin") {
-    if (!dataset.assignedTo || dataset.assignedTo.toString() !== user.userId) {
-      const err = new Error("Not assigned to you");
-      err.status = 403;
-      throw err;
-    }
+  if (user.role !== "admin" && dataset.assignedTo !== user.userId) {
+    const err = new Error("Not assigned to you");
+    err.status = 403;
+    throw err;
   }
 
   const trimmedSourceId = String(sourceId).trim();
   const trimmedText = String(commentText).trim();
 
   const duplicate = await Comment.findOne({
-    datasetId: dsId,
+    datasetId,
     sourceId: trimmedSourceId,
   });
   if (duplicate) {
@@ -159,7 +154,6 @@ async function createComment(
     throw err;
   }
 
-  const userId = new ObjectId(user.userId);
   const validOpts = await getValidOptionsForDataset(dataset);
   const validSentiment = validOpts.sentiment.has(sentiment)
     ? sentiment
@@ -171,11 +165,12 @@ async function createComment(
       : "annotated";
 
   const now = new Date();
+  const userId = user.userId;
 
-  let commentId;
+  let created;
   try {
-    commentId = await Comment.create({
-      datasetId: dsId,
+    created = await Comment.create({
+      datasetId,
       sourceId: trimmedSourceId,
       commentText: trimmedText,
       sentiment: validSentiment,
@@ -194,7 +189,7 @@ async function createComment(
       updatedAt: now,
     });
   } catch (err) {
-    if (err.code === 11000) {
+    if (err.name === "DuplicateKeyError") {
       const e = new Error("sourceId already exists in this dataset");
       e.status = 409;
       throw e;
@@ -203,7 +198,7 @@ async function createComment(
   }
 
   await CommentVersion.create({
-    commentId,
+    commentId: created.id,
     version: 1,
     snapshot: {
       commentText: trimmedText,
@@ -221,7 +216,7 @@ async function createComment(
     createdAt: now,
   });
 
-  return { commentId, message: "Comment created" };
+  return { commentId: created.id, message: "Comment created" };
 }
 
 async function getComment(id, user) {
@@ -231,13 +226,7 @@ async function getComment(id, user) {
     err.status = 404;
     throw err;
   }
-
-  if (!(await assertCanAccessComment(comment, user))) {
-    const err = new Error("Not assigned to you");
-    err.status = 403;
-    throw err;
-  }
-
+  await assertCanAccessComment(comment, user);
   return comment;
 }
 
@@ -254,14 +243,9 @@ async function updateCommentText(id, commentText, user) {
     err.status = 404;
     throw err;
   }
+  await assertCanAccessComment(existing, user);
 
-  if (!(await assertCanAccessComment(existing, user))) {
-    const err = new Error("Not assigned to you");
-    err.status = 403;
-    throw err;
-  }
-
-  const userId = new ObjectId(user.userId);
+  const userId = user.userId;
   const newVersion = existing.version + 1;
   const now = new Date();
   const newText = commentText.trim();
@@ -270,11 +254,10 @@ async function updateCommentText(id, commentText, user) {
     commentText: newText,
     version: newVersion,
     updatedBy: userId,
-    updatedAt: now,
   });
 
   await CommentVersion.create({
-    commentId: new ObjectId(id),
+    commentId: id,
     version: newVersion,
     snapshot: {
       commentText: newText,
@@ -302,12 +285,7 @@ async function annotateComment(id, { sentiment, type, annotationNote }, user) {
     err.status = 404;
     throw err;
   }
-
-  if (!(await assertCanAccessComment(existing, user))) {
-    const err = new Error("Not assigned to you");
-    err.status = 403;
-    throw err;
-  }
+  await assertCanAccessComment(existing, user);
 
   const dataset = await Dataset.findById(existing.datasetId);
   const validOpts = await getValidOptionsForDataset(dataset);
@@ -359,7 +337,7 @@ async function annotateComment(id, { sentiment, type, annotationNote }, user) {
     throw err;
   }
 
-  const userId = new ObjectId(user.userId);
+  const userId = user.userId;
   const now = new Date();
 
   const fullyAnnotated =
@@ -378,11 +356,10 @@ async function annotateComment(id, { sentiment, type, annotationNote }, user) {
     annotatedAt: now,
     version: newVersion,
     updatedBy: userId,
-    updatedAt: now,
   });
 
   await CommentVersion.create({
-    commentId: new ObjectId(id),
+    commentId: id,
     version: newVersion,
     snapshot: {
       commentText: existing.commentText,
@@ -420,36 +397,18 @@ async function bulkAnnotate({ ids, sentiment, type, annotationNote }, user) {
     throw err;
   }
 
-  const objectIds = [];
-  for (const raw of ids) {
-    const oid = toObjectId(raw);
-    if (!oid) {
-      const err = new Error(`Invalid id: ${raw}`);
-      err.status = 400;
-      throw err;
-    }
-    objectIds.push(oid);
-  }
-
-  const comments = await Comment.find({ _id: { $in: objectIds } });
-
-  if (comments.length !== objectIds.length) {
+  const comments = await Comment.findManyByIds(ids);
+  if (comments.length !== ids.length) {
     const err = new Error("One or more comments not found");
     err.status = 404;
     throw err;
   }
 
   if (user.role !== "admin") {
-    const datasetIds = [
-      ...new Set(comments.map((c) => c.datasetId.toString())),
-    ];
-    const allowed = await Dataset.find({
-      _id: { $in: datasetIds.map((id) => new ObjectId(id)) },
-      assignedTo: new ObjectId(user.userId),
-    });
-    const allowedIds = new Set(allowed.map((d) => d._id.toString()));
+    const assignedIds = await Dataset.findAssignedToIds(user.userId);
+    const assignedSet = new Set(assignedIds);
     for (const c of comments) {
-      if (!allowedIds.has(c.datasetId.toString())) {
+      if (!assignedSet.has(c.datasetId)) {
         const err = new Error("One or more comments are not assigned to you");
         err.status = 403;
         throw err;
@@ -458,27 +417,26 @@ async function bulkAnnotate({ ids, sentiment, type, annotationNote }, user) {
   }
 
   if (sentiment !== undefined || type !== undefined) {
-    const dsIds = [...new Set(comments.map((c) => c.datasetId.toString()))].map(
-      (id) => new ObjectId(id),
+    const datasetIds = [...new Set(comments.map((c) => c.datasetId))];
+    const datasets = await Promise.all(
+      datasetIds.map((id) => Dataset.findById(id)),
     );
-    const datasets = await Dataset.find({ _id: { $in: dsIds } });
-    const map = new Map();
-    datasets.forEach((d) => map.set(d._id.toString(), d));
+    const map = new Map(datasets.filter(Boolean).map((d) => [d.id, d]));
 
     for (const c of comments) {
-      const ds = map.get(c.datasetId.toString());
+      const ds = map.get(c.datasetId);
       const opts = await getValidOptionsForDataset(ds);
 
       if (sentiment !== undefined && !opts.sentiment.has(sentiment)) {
         const err = new Error(
-          `Invalid sentiment "${sentiment}" for dataset "${ds?.name || c.datasetId.toString()}"`,
+          `Invalid sentiment "${sentiment}" for dataset "${ds?.name || c.datasetId}"`,
         );
         err.status = 400;
         throw err;
       }
       if (type !== undefined && !opts.type.has(type)) {
         const err = new Error(
-          `Invalid type "${type}" for dataset "${ds?.name || c.datasetId.toString()}"`,
+          `Invalid type "${type}" for dataset "${ds?.name || c.datasetId}"`,
         );
         err.status = 400;
         throw err;
@@ -486,11 +444,10 @@ async function bulkAnnotate({ ids, sentiment, type, annotationNote }, user) {
     }
   }
 
-  const userId = new ObjectId(user.userId);
+  const userId = user.userId;
   const now = new Date();
   const versionsToInsert = [];
-  const bulkOps = [];
-  let updated = 0;
+  const patches = [];
 
   for (const existing of comments) {
     const changed = [];
@@ -512,27 +469,22 @@ async function bulkAnnotate({ ids, sentiment, type, annotationNote }, user) {
 
     const newVersion = existing.version + 1;
 
-    bulkOps.push({
-      updateOne: {
-        filter: { _id: existing._id },
-        update: {
-          $set: {
-            sentiment: newSentiment,
-            type: newType,
-            annotationNote: newNote,
-            status: newStatus,
-            annotatedBy: userId,
-            annotatedAt: now,
-            version: newVersion,
-            updatedBy: userId,
-            updatedAt: now,
-          },
-        },
+    patches.push({
+      id: existing.id,
+      patch: {
+        sentiment: newSentiment,
+        type: newType,
+        annotationNote: newNote,
+        status: newStatus,
+        annotatedBy: userId,
+        annotatedAt: now,
+        version: newVersion,
+        updatedBy: userId,
       },
     });
 
     versionsToInsert.push({
-      commentId: existing._id,
+      commentId: existing.id,
       version: newVersion,
       snapshot: {
         commentText: existing.commentText,
@@ -549,25 +501,25 @@ async function bulkAnnotate({ ids, sentiment, type, annotationNote }, user) {
       changedBy: userId,
       createdAt: now,
     });
-
-    updated++;
   }
 
-  if (bulkOps.length > 0) {
-    await Comment.bulkWrite(bulkOps);
+  const updated = patches.length;
+
+  if (patches.length > 0) {
+    await Comment.bulkUpdate(patches);
     await CommentVersion.insertMany(versionsToInsert);
 
     await audit({
       action: "comment.bulk_annotate",
       actor: user,
-      metadata: { requested: objectIds.length, updated, sentiment, type },
+      metadata: { requested: ids.length, updated, sentiment, type },
     });
   }
 
   return {
-    requested: objectIds.length,
+    requested: ids.length,
     updated,
-    skipped: objectIds.length - updated,
+    skipped: ids.length - updated,
   };
 }
 
@@ -585,44 +537,22 @@ async function bulkAssign({ ids, assignedTo }, user) {
 
   let newAssignee = null;
   if (assignedTo !== null && assignedTo !== undefined && assignedTo !== "") {
-    const uid = toObjectId(assignedTo);
-    if (!uid) {
-      const err = new Error("Invalid assignedTo");
-      err.status = 400;
-      throw err;
-    }
-    const assignee = await getDB()
-      .collection("users")
-      .findOne({ _id: uid, isActive: true });
-    if (!assignee) {
+    const assignee = await User.findById(assignedTo);
+    if (!assignee || !assignee.isActive) {
       const err = new Error("Assignee not found or inactive");
       err.status = 404;
       throw err;
     }
-    newAssignee = uid;
-  }
-
-  const objectIds = [];
-  for (const raw of ids) {
-    const oid = toObjectId(raw);
-    if (!oid) {
-      const err = new Error(`Invalid id: ${raw}`);
-      err.status = 400;
-      throw err;
-    }
-    objectIds.push(oid);
+    newAssignee = assignee.id;
   }
 
   const now = new Date();
   const result = await Comment.updateMany(
-    { _id: { $in: objectIds } },
+    { ids },
     {
-      $set: {
-        assignedTo: newAssignee,
-        assignedAt: newAssignee ? now : null,
-        assignedBy: new ObjectId(user.userId),
-        updatedAt: now,
-      },
+      assignedTo: newAssignee,
+      assignedAt: newAssignee ? now : null,
+      assignedBy: user.userId,
     },
   );
 
@@ -631,7 +561,7 @@ async function bulkAssign({ ids, assignedTo }, user) {
     actor: user,
     metadata: {
       count: result.modifiedCount,
-      assignedTo: newAssignee?.toString() || null,
+      assignedTo: newAssignee || null,
     },
   });
 
@@ -652,18 +582,20 @@ async function getCommentVersions(id, query, user) {
     err.status = 404;
     throw err;
   }
-  if (!(await assertCanAccessComment(comment, user))) {
-    const err = new Error("Not assigned to you");
-    err.status = 403;
-    throw err;
-  }
+  await assertCanAccessComment(comment, user);
 
   const [total, versions] = await Promise.all([
     CommentVersion.countByCommentId(id),
     CommentVersion.findByCommentId(id, { skip, limit }),
   ]);
 
-  return { page, limit, total, totalPages: Math.ceil(total / limit), versions };
+  return {
+    page,
+    limit,
+    total,
+    totalPages: Math.ceil(total / limit),
+    versions,
+  };
 }
 
 async function restoreCommentVersion(id, targetVersion, user) {
@@ -673,15 +605,10 @@ async function restoreCommentVersion(id, targetVersion, user) {
     err.status = 404;
     throw err;
   }
-
-  if (!(await assertCanAccessComment(existing, user))) {
-    const err = new Error("Not assigned to you");
-    err.status = 403;
-    throw err;
-  }
+  await assertCanAccessComment(existing, user);
 
   const versionRecord = await CommentVersion.findOne({
-    commentId: new ObjectId(id),
+    commentId: id,
     version: targetVersion,
   });
   if (!versionRecord) {
@@ -691,7 +618,7 @@ async function restoreCommentVersion(id, targetVersion, user) {
   }
 
   const snap = versionRecord.snapshot;
-  const userId = new ObjectId(user.userId);
+  const userId = user.userId;
   const newVersion = existing.version + 1;
   const now = new Date();
 
@@ -703,11 +630,10 @@ async function restoreCommentVersion(id, targetVersion, user) {
     annotationNote: snap.annotationNote,
     version: newVersion,
     updatedBy: userId,
-    updatedAt: now,
   });
 
   await CommentVersion.create({
-    commentId: new ObjectId(id),
+    commentId: id,
     version: newVersion,
     snapshot: {
       commentText: snap.commentText,
@@ -741,7 +667,7 @@ async function deleteComment(id, actor) {
     throw err;
   }
 
-  await CommentVersion.deleteMany({ commentId: new ObjectId(id) });
+  await CommentVersion.deleteByCommentId(id);
   await Comment.deleteById(id);
 
   await audit({
@@ -749,14 +675,105 @@ async function deleteComment(id, actor) {
     actor,
     targetType: "comment",
     targetId: id,
-    metadata: { datasetId: comment.datasetId.toString() },
+    metadata: { datasetId: comment.datasetId },
   });
 
   return { message: "Comment deleted" };
 }
 
+/**
+ * Inner export worker. Do NOT call directly — use `exportComments` so
+ * the job is enqueued and concurrency is bounded.
+ */
+async function _exportComments({ query, user, format }) {
+  if (!["csv", "xlsx"].includes(format)) {
+    const err = new Error("format must be csv or xlsx");
+    err.status = 400;
+    throw err;
+  }
+
+  const filter = buildDomainFilter(query);
+
+  if (user.role !== "admin") {
+    const allowedIds = await Dataset.findAssignedToIds(user.userId);
+    if (filter.datasetId) {
+      if (!allowedIds.includes(filter.datasetId)) {
+        const err = new Error("Not assigned to you");
+        err.status = 403;
+        throw err;
+      }
+    } else {
+      filter.datasetIds = allowedIds;
+    }
+  }
+
+  const comments = await Comment.findForExport(filter);
+
+  const header = [
+    "id",
+    "comment_text",
+    "sentiment",
+    "type",
+    "status",
+    "version",
+    "annotatedAt",
+  ];
+  const rows = comments.map((c) => [
+    c.sourceId,
+    c.commentText,
+    c.sentiment,
+    c.type,
+    c.status,
+    c.version,
+    c.annotatedAt ? new Date(c.annotatedAt).toISOString() : "",
+  ]);
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+
+  if (format === "csv") {
+    const escapeCsv = (v) => {
+      let s = v === null || v === undefined ? "" : String(v);
+      if (/^[=+\-@]/.test(s)) s = "'" + s;
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      header.join(","),
+      ...rows.map((r) => r.map(escapeCsv).join(",")),
+    ];
+    return {
+      contentType: "text/csv; charset=utf-8",
+      filename: `comments-${timestamp}.csv`,
+      body: "\uFEFF" + lines.join("\r\n"),
+    };
+  }
+
+  const ExcelJS = require("exceljs");
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("comments");
+  sheet.addRow(header);
+  rows.forEach((r) => sheet.addRow(r));
+
+  const buffer = await workbook.xlsx.writeBuffer();
+
+  return {
+    contentType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    filename: `comments-${timestamp}.xlsx`,
+    body: Buffer.from(buffer),
+  };
+}
+
+/**
+ * Public export entry — enqueued so concurrency is bounded by
+ * MAX_CONCURRENT_EXPORTS.
+ */
+function exportComments(args) {
+  return exportQueue.run(() => _exportComments(args));
+}
+
 module.exports = {
-  buildFilter,
+  buildDomainFilter,
   listComments,
   createComment,
   getComment,
@@ -767,4 +784,5 @@ module.exports = {
   getCommentVersions,
   restoreCommentVersion,
   deleteComment,
+  exportComments,
 };

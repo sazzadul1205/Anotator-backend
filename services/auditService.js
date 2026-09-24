@@ -1,28 +1,26 @@
-const { ObjectId } = require("mongodb");
-const AuditLog = require("../models/AuditLog");
+// services/auditService.js
+// Read-only access to audit log entries with filtering and pagination.
 
+const { AuditLog } = require("../models");
+
+/**
+ * List audit entries with optional filters.
+ * Query: page, limit, action, actorId, targetType, targetId, from, to.
+ */
 async function listAuditEntries(query) {
   const page = parseInt(query.page, 10) || 1;
   const limit = Math.min(parseInt(query.limit, 10) || 50, 200);
-  const skip = (page - 1) * limit;
 
+  // Build a domain filter — no $operators, no ObjectId
   const filter = {};
   if (query.action) filter.action = query.action;
-  if (query.actorId && ObjectId.isValid(query.actorId))
-    filter.actorId = query.actorId;
+  if (query.actorId) filter.actorId = query.actorId;
   if (query.targetType) filter.targetType = query.targetType;
-  if (query.targetId && ObjectId.isValid(query.targetId))
-    filter.targetId = query.targetId;
-  if (query.from || query.to) {
-    filter.at = {};
-    if (query.from) filter.at.$gte = new Date(query.from);
-    if (query.to) filter.at.$lte = new Date(query.to);
-  }
+  if (query.targetId) filter.targetId = query.targetId;
+  if (query.from) filter.from = query.from;
+  if (query.to) filter.to = query.to;
 
-  const [total, entries] = await Promise.all([
-    AuditLog.count(filter),
-    AuditLog.find(filter, { skip, limit }),
-  ]);
+  const { entries, total } = await AuditLog.findMany(filter, { page, limit });
 
   return {
     page,
@@ -33,6 +31,9 @@ async function listAuditEntries(query) {
   };
 }
 
+/**
+ * Return the distinct list of actions recorded in the audit log.
+ */
 async function listActions() {
   const actions = await AuditLog.distinctActions();
   return actions.sort();

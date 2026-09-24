@@ -1,10 +1,12 @@
-const { ObjectId } = require("mongodb");
-const Dataset = require("../models/Dataset");
-const Comment = require("../models/Comment");
-const CommentVersion = require("../models/CommentVersion");
-const User = require("../models/User");
+// services/datasetService.js
+// Stats, listing, assignment, duplication, rename, delete for datasets.
+
+const { Comment, CommentVersion, Dataset, User } = require("../models");
 const { audit } = require("../utils/audit");
 
+/**
+ * Admin dashboard stats.
+ */
 async function getStats() {
   const now = new Date();
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -15,8 +17,8 @@ async function getStats() {
     annotatedComments,
     pendingComments,
     activeAnnotators,
-    datasetsByStatus,
-    recentComments,
+    statusRows,
+    activityRows,
   ] = await Promise.all([
     Dataset.countAll(),
     Comment.count({}),
@@ -24,13 +26,13 @@ async function getStats() {
     Comment.count({ status: "pending" }),
     User.countActiveAnnotators(),
     Dataset.countByStatus(),
-    CommentVersion.activityByDate({ createdAt: { $gte: sevenDaysAgo } }),
+    CommentVersion.activityByDate(sevenDaysAgo),
   ]);
 
   const statusMap = { pending: 0, processing: 0, completed: 0, failed: 0 };
-  datasetsByStatus.forEach((s) => {
-    statusMap[s._id] = s.count;
-  });
+  for (const row of statusRows) {
+    statusMap[row.status] = row.count;
+  }
 
   const percentAnnotated =
     totalComments === 0
@@ -45,32 +47,30 @@ async function getStats() {
     activeAnnotators,
     percentAnnotated,
     datasetsByStatus: statusMap,
-    activityLast7Days: recentComments.map((r) => ({
-      date: r._id,
-      count: r.count,
-    })),
+    activityLast7Days: activityRows,
   };
 }
 
+/**
+ * List datasets. Admins see all; annotators only see assigned ones.
+ * When includeCounts=true, attaches per-dataset comment counts.
+ */
 async function listDatasets(query, user) {
   const filter = {};
   if (query.status) filter.status = query.status;
-  if (query.uploadedBy && ObjectId.isValid(query.uploadedBy)) {
-    filter.uploadedBy = new ObjectId(query.uploadedBy);
-  }
-  if (user.role !== "admin") {
-    filter.assignedTo = new ObjectId(user.userId);
-  }
+  if (query.uploadedBy) filter.uploadedBy = query.uploadedBy;
+  if (user.role !== "admin") filter.assignedTo = user.userId;
 
   const includeCounts = query.includeCounts === "true";
 
   if (!includeCounts) {
-    return Dataset.findAll(filter);
+    return Dataset.findMany(filter);
   }
 
-  const datasets = await Dataset.findWithCounts(filter);
+  const datasets = await Dataset.findManyWithCounts(filter);
   return datasets.map((d) => ({
     ...d,
+    _id: d.id,
     summary: {
       total: d.summary.total,
       annotated: d.summary.annotated,
@@ -80,24 +80,14 @@ async function listDatasets(query, user) {
 }
 
 async function getDataset(id, user) {
-  if (!ObjectId.isValid(id)) {
-    const err = new Error("Invalid id");
-    err.status = 400;
-    throw err;
-  }
-  const datasetId = new ObjectId(id);
-
-  const dataset = await Dataset.findById(datasetId);
+  const dataset = await Dataset.findById(id);
   if (!dataset) {
     const err = new Error("Dataset not found");
     err.status = 404;
     throw err;
   }
 
-  if (
-    user.role !== "admin" &&
-    (!dataset.assignedTo || dataset.assignedTo.toString() !== user.userId)
-  ) {
+  if (user.role !== "admin" && dataset.assignedTo !== user.userId) {
     const err = new Error("Not assigned to you");
     err.status = 403;
     throw err;
@@ -105,21 +95,14 @@ async function getDataset(id, user) {
 
   let summary = { total: 0, pending: 0, annotated: 0 };
   if (dataset.status === "completed") {
-    summary = await Comment.countByStatus(datasetId);
+    summary = await Comment.countByStatus(id);
   }
 
   return { dataset, summary };
 }
 
 async function assignDataset(id, assignedTo, actor) {
-  if (!ObjectId.isValid(id)) {
-    const err = new Error("Invalid id");
-    err.status = 400;
-    throw err;
-  }
-  const datasetId = new ObjectId(id);
-
-  const dataset = await Dataset.findById(datasetId);
+  const dataset = await Dataset.findById(id);
   if (!dataset) {
     const err = new Error("Dataset not found");
     err.status = 404;
@@ -128,14 +111,7 @@ async function assignDataset(id, assignedTo, actor) {
 
   let newAssignee = null;
   if (assignedTo !== null && assignedTo !== undefined && assignedTo !== "") {
-    if (!ObjectId.isValid(assignedTo)) {
-      const err = new Error("Invalid assignedTo");
-      err.status = 400;
-      throw err;
-    }
-    newAssignee = new ObjectId(assignedTo);
-
-    const user = await User.findById(newAssignee);
+    const user = await User.findById(assignedTo);
     if (!user) {
       const err = new Error("Assignee not found");
       err.status = 404;
@@ -146,9 +122,10 @@ async function assignDataset(id, assignedTo, actor) {
       err.status = 400;
       throw err;
     }
+    newAssignee = user.id;
   }
 
-  await Dataset.updateById(datasetId, {
+  await Dataset.updateById(id, {
     assignedTo: newAssignee,
     assignedAt: newAssignee ? new Date() : null,
   });
@@ -157,34 +134,28 @@ async function assignDataset(id, assignedTo, actor) {
     action: newAssignee ? "dataset.assign" : "dataset.unassign",
     actor,
     targetType: "dataset",
-    targetId: datasetId.toString(),
-    metadata: { assignedTo: newAssignee?.toString() || null },
+    targetId: id,
+    metadata: { assignedTo: newAssignee || null },
   });
 
-  return { message: newAssignee ? "Dataset assigned" : "Dataset unassigned" };
+  return {
+    message: newAssignee ? "Dataset assigned" : "Dataset unassigned",
+  };
 }
 
 async function duplicateDataset(id, name, actor) {
-  if (!ObjectId.isValid(id)) {
-    const err = new Error("Invalid id");
-    err.status = 400;
-    throw err;
-  }
-  const sourceId = new ObjectId(id);
-
-  const source = await Dataset.findById(sourceId);
+  const source = await Dataset.findById(id);
   if (!source) {
     const err = new Error("Dataset not found");
     err.status = 404;
     throw err;
   }
 
-  const userId = new ObjectId(actor.userId);
+  const userId = actor.userId;
   const now = new Date();
-
   const newName = (name && name.trim()) || `${source.name} (copy)`;
 
-  const newDatasetId = await Dataset.create({
+  const { id: newDatasetId } = await Dataset.create({
     name: newName,
     originalFileName: source.originalFileName,
     fileType: source.fileType,
@@ -208,52 +179,74 @@ async function duplicateDataset(id, name, actor) {
     uploadedBy: userId,
     assignedTo: null,
     assignedAt: null,
-    duplicatedFrom: sourceId,
+    duplicatedFrom: source.id,
   });
 
-  const sourceComments = await Comment.find({ datasetId: sourceId });
+  // Fetch all source comments + their versions, then remap ids
+  const sourceComments = await Comment.findMany(
+    { datasetId: source.id },
+    { page: 1, limit: 1_000_000 },
+  );
+  const comments = sourceComments.comments;
+
   let copiedCount = 0;
 
-  if (sourceComments.length > 0) {
+  if (comments.length > 0) {
+    // Insert new comments one by one so we can capture new ids
+    // (also handles duplicate sourceId constraints cleanly per dataset).
     const idMap = new Map();
-
-    const newComments = sourceComments.map((c) => {
-      const newId = new ObjectId();
-      idMap.set(c._id.toString(), newId);
-      copiedCount++;
-
-      return {
-        ...c,
-        _id: newId,
+    const newCommentDtos = comments.map((c) => {
+      const dto = {
         datasetId: newDatasetId,
+        sourceId: c.sourceId,
+        commentText: c.commentText,
+        sentiment: c.sentiment,
+        type: c.type,
+        status: c.status,
+        assignedTo: null,
+        assignedAt: null,
+        assignedBy: null,
+        annotatedBy: c.annotatedBy,
+        annotatedAt: c.annotatedAt,
+        annotationNote: c.annotationNote,
+        version: c.version,
         createdBy: userId,
         updatedBy: userId,
         createdAt: now,
         updatedAt: now,
+        _oldId: c.id,
       };
+      return dto;
     });
 
-    await Comment.insertMany(newComments);
+    const inserted = await Comment.insertMany(newCommentDtos);
+    for (const ins of inserted) {
+      const dto = newCommentDtos[ins.index];
+      if (dto && dto._oldId) idMap.set(dto._oldId, ins.id);
+    }
+    copiedCount = inserted.length;
 
-    const sourceVersions = await CommentVersion.collection()
-      .find({ commentId: { $in: sourceComments.map((c) => c._id) } })
-      .toArray();
+    // Copy versions
+    const oldIds = comments.map((c) => c.id);
+    const sourceVersions = await CommentVersion.findRawByCommentIds(oldIds);
 
     if (sourceVersions.length > 0) {
-      const newVersions = sourceVersions
-        .map((v) => {
-          const mappedCommentId = idMap.get(v.commentId.toString());
-          if (!mappedCommentId) return null;
-          return {
-            ...v,
-            _id: new ObjectId(),
-            commentId: mappedCommentId,
-            changedBy: userId,
-            createdAt: now,
-          };
-        })
-        .filter(Boolean);
-
+      const newVersions = [];
+      for (const v of sourceVersions) {
+        const oldCid = v.commentId.toString();
+        const newCid = idMap.get(oldCid);
+        if (!newCid) continue;
+        newVersions.push({
+          commentId: newCid,
+          version: v.version,
+          snapshot: v.snapshot,
+          changedFields: v.changedFields || [],
+          changeType: v.changeType,
+          restoredFrom: v.restoredFrom ?? null,
+          changedBy: userId,
+          createdAt: now,
+        });
+      }
       if (newVersions.length > 0) {
         await CommentVersion.insertMany(newVersions);
       }
@@ -264,8 +257,8 @@ async function duplicateDataset(id, name, actor) {
     action: "dataset.duplicate",
     actor,
     targetType: "dataset",
-    targetId: newDatasetId.toString(),
-    metadata: { sourceId: sourceId.toString(), copiedComments: copiedCount },
+    targetId: newDatasetId,
+    metadata: { sourceId: id, copiedComments: copiedCount },
   });
 
   return {
@@ -282,14 +275,7 @@ async function renameDataset(id, name, actor) {
     throw err;
   }
 
-  if (!ObjectId.isValid(id)) {
-    const err = new Error("Invalid id");
-    err.status = 400;
-    throw err;
-  }
-  const datasetId = new ObjectId(id);
-
-  const result = await Dataset.updateById(datasetId, { name: name.trim() });
+  const result = await Dataset.updateById(id, { name: name.trim() });
   if (result.matchedCount === 0) {
     const err = new Error("Dataset not found");
     err.status = 404;
@@ -300,7 +286,7 @@ async function renameDataset(id, name, actor) {
     action: "dataset.rename",
     actor,
     targetType: "dataset",
-    targetId: datasetId.toString(),
+    targetId: id,
     metadata: { name: name.trim() },
   });
 
@@ -308,37 +294,31 @@ async function renameDataset(id, name, actor) {
 }
 
 async function deleteDataset(id, actor) {
-  if (!ObjectId.isValid(id)) {
-    const err = new Error("Invalid id");
-    err.status = 400;
-    throw err;
-  }
-  const datasetId = new ObjectId(id);
-
-  const dataset = await Dataset.findById(datasetId);
+  const dataset = await Dataset.findById(id);
   if (!dataset) {
     const err = new Error("Dataset not found");
     err.status = 404;
     throw err;
   }
 
-  const comments = await Comment.find(
-    { datasetId },
-    { projection: { _id: 1 } },
+  // Delete comments + their versions first
+  const { comments } = await Comment.findMany(
+    { datasetId: id },
+    { page: 1, limit: 1_000_000 },
   );
-  const commentIds = comments.map((c) => c._id);
+  const commentIds = comments.map((c) => c.id);
 
   if (commentIds.length) {
-    await CommentVersion.deleteMany({ commentId: { $in: commentIds } });
-    await Comment.deleteMany({ datasetId });
+    await CommentVersion.deleteByCommentIds(commentIds);
+    await Comment.deleteMany({ datasetId: id });
   }
-  await Dataset.deleteById(datasetId);
+  await Dataset.deleteById(id);
 
   await audit({
     action: "dataset.delete",
     actor,
     targetType: "dataset",
-    targetId: datasetId.toString(),
+    targetId: id,
     metadata: { name: dataset.name, deletedComments: commentIds.length },
   });
 

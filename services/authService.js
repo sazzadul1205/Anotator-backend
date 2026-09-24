@@ -1,17 +1,25 @@
+// services/authService.js
+// First-time admin bootstrap, login, logout.
+
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { ObjectId } = require("mongodb");
-const User = require("../models/User");
-const SystemLock = require("../models/SystemLock");
+const { User, SystemLock } = require("../models");
 const { audit } = require("../utils/audit");
 
 const BOOTSTRAP_LOCK_ID = "admin_bootstrap";
 
+/**
+ * Report whether an admin already exists.
+ */
 async function getBootstrapStatus() {
   const adminCount = await User.countAdmins();
   return { adminCount };
 }
 
+/**
+ * Create the first admin. Uses a system lock so concurrent requests
+ * can't both succeed.
+ */
 async function bootstrapAdmin({ name, email, password, confirmPassword }) {
   if (!name || !email || !password || !confirmPassword) {
     const err = new Error("Missing fields");
@@ -31,11 +39,12 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
 
   let lockClaimed = false;
   try {
+    // Try to claim the bootstrap lock
     try {
       await SystemLock.claim(BOOTSTRAP_LOCK_ID);
       lockClaimed = true;
     } catch (err) {
-      if (err.code === 11000) {
+      if (err.name === "DuplicateKeyError") {
         const e = new Error("Admin account already exists");
         e.status = 400;
         throw e;
@@ -43,9 +52,11 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
       throw err;
     }
 
+    // Secondary check
     const adminCount = await User.countAdmins();
     if (adminCount > 0) {
       await SystemLock.release(BOOTSTRAP_LOCK_ID);
+      lockClaimed = false;
       const e = new Error("Admin account already exists");
       e.status = 400;
       throw e;
@@ -54,7 +65,7 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
     const hashedPassword = await bcrypt.hash(password, 10);
     const normalizedEmail = email.toLowerCase().trim();
 
-    const userId = await User.create({
+    const { id: userId } = await User.create({
       email: normalizedEmail,
       name: name.trim(),
       password: hashedPassword,
@@ -65,7 +76,7 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
       action: "auth.bootstrap",
       actor: null,
       targetType: "user",
-      targetId: userId.toString(),
+      targetId: userId,
       metadata: { email: normalizedEmail },
     });
 
@@ -75,13 +86,16 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
       try {
         await SystemLock.release(BOOTSTRAP_LOCK_ID);
       } catch {
-        // 
+        // best effort
       }
     }
     throw err;
   }
 }
 
+/**
+ * Authenticate and issue a JWT.
+ */
 async function login({ email, password, ip }) {
   if (!email || !password) {
     const err = new Error("Missing fields");
@@ -105,7 +119,7 @@ async function login({ email, password, ip }) {
 
   const token = jwt.sign(
     {
-      userId: user._id.toString(),
+      userId: user.id,
       role: user.role,
       tokenVersion: user.tokenVersion || 0,
     },
@@ -115,17 +129,13 @@ async function login({ email, password, ip }) {
 
   await audit({
     action: "auth.login",
-    actor: {
-      userId: user._id.toString(),
-      email: user.email,
-      role: user.role,
-    },
+    actor: { userId: user.id, email: user.email, role: user.role },
     metadata: { ip },
   });
 
   return {
     user: {
-      _id: user._id.toString(),
+      _id: user.id,
       email: user.email,
       name: user.name,
       role: user.role,
@@ -137,12 +147,11 @@ async function login({ email, password, ip }) {
   };
 }
 
+/**
+ * Invalidate the user's tokens by bumping tokenVersion.
+ */
 async function logout(reqUser, ip) {
-  await User.updateById(reqUser.userId, {}); // triggers updatedAt
-  await User.collection().updateOne(
-    { _id: new ObjectId(reqUser.userId) },
-    { $inc: { tokenVersion: 1 }, $set: { updatedAt: new Date() } },
-  );
+  await User.bumpTokenVersion(reqUser.userId);
 
   await audit({
     action: "auth.logout",

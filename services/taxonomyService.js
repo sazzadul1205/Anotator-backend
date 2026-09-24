@@ -1,10 +1,15 @@
-const { ObjectId } = require("mongodb");
-const Taxonomy = require("../models/Taxonomy");
-const Dataset = require("../models/Dataset");
+// services/taxonomyService.js
+// Manage taxonomies and their assignment to datasets.
+
+const { Taxonomy, Dataset } = require("../models");
 const { audit } = require("../utils/audit");
 
 const DEFAULT_SENTIMENTS = ["positive", "negative", "neutral", "unannotated"];
 const DEFAULT_TYPES = ["bangla", "english", "banglish", "unclassified"];
+
+// ---------------------------------------------------------------------------
+// Pure validation / normalization helpers
+// ---------------------------------------------------------------------------
 
 function slugify(str) {
   return String(str)
@@ -79,6 +84,10 @@ function validateAndNormalize(sentiment, type) {
   return { sentiment: sRes.items, type: tRes.items };
 }
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 async function listTaxonomies(query, user) {
   const filter = {};
   if (query.kind) {
@@ -93,7 +102,7 @@ async function listTaxonomies(query, user) {
   else if (query.isActive !== undefined)
     filter.isActive = query.isActive === "true";
 
-  return Taxonomy.find(filter);
+  return Taxonomy.findMany(filter);
 }
 
 async function getDefaults() {
@@ -110,11 +119,7 @@ async function getForDataset(datasetId, user) {
     err.status = 404;
     throw err;
   }
-
-  if (
-    user.role !== "admin" &&
-    (!dataset.assignedTo || dataset.assignedTo.toString() !== user.userId)
-  ) {
+  if (user.role !== "admin" && dataset.assignedTo !== user.userId) {
     const err = new Error("Not assigned to you");
     err.status = 403;
     throw err;
@@ -133,8 +138,8 @@ async function getForDataset(datasetId, user) {
     : DEFAULT_TYPES.map((label, i) => ({ value: label, label, order: i }));
 
   return {
-    datasetId: datasetId.toString(),
-    taxonomyId: dataset.taxonomyId ? dataset.taxonomyId.toString() : null,
+    datasetId: dataset.id,
+    taxonomyId: dataset.taxonomyId || null,
     taxonomyName: taxonomy ? taxonomy.name : "Default",
     sentiment,
     type,
@@ -163,24 +168,22 @@ async function createTaxonomy(
     throw err;
   }
 
-  const doc = {
+  const { id: taxonomyId } = await Taxonomy.create({
     name: name.trim(),
     description: String(description).trim().slice(0, 500),
     sentiment: result.sentiment,
     type: result.type,
     isActive: true,
-    createdBy: new ObjectId(actor.userId),
-    updatedBy: new ObjectId(actor.userId),
-  };
-
-  const taxonomyId = await Taxonomy.create(doc);
+    createdBy: actor.userId,
+    updatedBy: actor.userId,
+  });
 
   await audit({
     action: "taxonomy.create",
     actor,
     targetType: "taxonomy",
-    targetId: taxonomyId.toString(),
-    metadata: { name: doc.name },
+    targetId: taxonomyId,
+    metadata: { name: name.trim() },
   });
 
   return { taxonomyId, message: "Taxonomy created" };
@@ -209,7 +212,7 @@ async function updateTaxonomy(id, body, actor) {
     throw err;
   }
 
-  const updates = { updatedBy: new ObjectId(actor.userId) };
+  const updates = { updatedBy: actor.userId };
 
   if (body.name !== undefined) {
     if (typeof body.name !== "string" || !body.name.trim()) {
@@ -309,7 +312,7 @@ async function assignToDataset(taxonomyId, datasetId, actor) {
   }
 
   await Dataset.updateById(datasetId, {
-    taxonomyId: taxonomy._id,
+    taxonomyId: taxonomy.id,
     taxonomyName: taxonomy.name,
     taxonomyAssignedAt: new Date(),
   });
@@ -318,8 +321,8 @@ async function assignToDataset(taxonomyId, datasetId, actor) {
     action: "taxonomy.assign_to_dataset",
     actor,
     targetType: "dataset",
-    targetId: datasetId.toString(),
-    metadata: { taxonomyId: taxonomyId.toString(), name: taxonomy.name },
+    targetId: datasetId,
+    metadata: { taxonomyId, name: taxonomy.name },
   });
 
   return { message: "Taxonomy assigned to dataset" };
@@ -332,26 +335,19 @@ async function unassignFromDataset(taxonomyId, datasetId, actor) {
     err.status = 404;
     throw err;
   }
-  if (!dataset.taxonomyId || dataset.taxonomyId.toString() !== taxonomyId) {
+  if (!dataset.taxonomyId || dataset.taxonomyId !== taxonomyId) {
     const err = new Error("Dataset is not using this taxonomy");
     err.status = 400;
     throw err;
   }
 
-  const db = require("../config/db").getDB();
-  await db.collection("datasets").updateOne(
-    { _id: new ObjectId(datasetId) },
-    {
-      $unset: { taxonomyId: "", taxonomyName: "", taxonomyAssignedAt: "" },
-      $set: { updatedAt: new Date() },
-    },
-  );
+  await Dataset.clearTaxonomy(datasetId);
 
   await audit({
     action: "taxonomy.unassign_from_dataset",
     actor,
     targetType: "dataset",
-    targetId: datasetId.toString(),
+    targetId: datasetId,
     metadata: { taxonomyId },
   });
 
