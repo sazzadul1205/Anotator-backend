@@ -1,79 +1,128 @@
 // models/Taxonomy.js
-// Handles the "taxonomies" collection — reusable label sets.
-// A taxonomy is a named group of sentiment options + type options
-// (e.g. positive/negative/neutral + bangla/english/banglish).
-// Any dataset can reference a taxonomy.
+// Reusable label sets attached to datasets.
 
 const { ObjectId } = require("mongodb");
 const { getDB } = require("../config/db");
 
 const COLLECTION = "taxonomies";
 
+function toOid(id) {
+  if (!id) return null;
+  try {
+    return new ObjectId(id);
+  } catch {
+    return null;
+  }
+}
+
+function idStr(v) {
+  if (v === null) return null;
+  return typeof v === "string" ? v : v.toString();
+}
+
+function toDTO(doc) {
+  if (!doc) return null;
+  return {
+    id: idStr(doc._id),
+    name: doc.name,
+    description: doc.description ?? "",
+    sentiment: doc.sentiment || [],
+    type: doc.type || [],
+    isActive: doc.isActive,
+    createdBy: idStr(doc.createdBy),
+    updatedBy: idStr(doc.updatedBy),
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+}
+
+function toMongoFilter(domain = {}) {
+  const f = {};
+  if (domain.kind) f.kind = domain.kind;
+  if (domain.isActive !== undefined) f.isActive = domain.isActive;
+  return f;
+}
+
 class Taxonomy {
   static collection() {
     return getDB().collection(COLLECTION);
   }
 
-  // Find a taxonomy by _id.
   static async findById(id) {
-    return this.collection().findOne({ _id: new ObjectId(id) });
+    const oid = toOid(id);
+    if (!oid) return null;
+    const doc = await this.collection().findOne({ _id: oid });
+    return toDTO(doc);
   }
 
-  // List taxonomies with optional filter.
-  // Sorted by kind → order → label for a stable UI display.
-  static async find(filter = {}, options = {}) {
-    let cursor = this.collection().find(filter);
-    cursor = cursor.sort({ kind: 1, order: 1, label: 1 });
-    if (options.projection) cursor = cursor.project(options.projection);
-    return cursor.toArray();
+  /** List taxonomies, sorted by kind -> order -> label. */
+  static async findMany(domainFilter = {}) {
+    const docs = await this.collection()
+      .find(toMongoFilter(domainFilter))
+      .sort({ kind: 1, order: 1, label: 1 })
+      .toArray();
+    return docs.map(toDTO);
   }
 
-  // Create a taxonomy. Auto-stamps timestamps.
-  static async create(doc) {
+  /** Create a taxonomy. Returns { id }. */
+  static async create(dto) {
     const now = new Date();
-    const result = await this.collection().insertOne({
-      ...doc,
+    const doc = {
+      name: dto.name,
+      description: dto.description || "",
+      sentiment: dto.sentiment || [],
+      type: dto.type || [],
+      isActive: dto.isActive !== false,
+      createdBy: dto.createdBy ? toOid(dto.createdBy) : null,
+      updatedBy: dto.updatedBy ? toOid(dto.updatedBy) : null,
       createdAt: now,
       updatedAt: now,
-    });
-    return result.insertedId;
+    };
+    const r = await this.collection().insertOne(doc);
+    return { id: r.insertedId.toString() };
   }
 
-  // Update any fields; auto-bumps updatedAt.
-  static async updateById(id, updates) {
-    return this.collection().updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { ...updates, updatedAt: new Date() } },
-    );
+  static async updateById(id, patch) {
+    const oid = toOid(id);
+    if (!oid) return { matchedCount: 0, modifiedCount: 0 };
+    const set = { ...patch, updatedAt: new Date() };
+    delete set.id;
+    delete set._id;
+    if ("updatedBy" in set) {
+      set.updatedBy = set.updatedBy ? toOid(set.updatedBy) : null;
+    }
+    const r = await this.collection().updateOne({ _id: oid }, { $set: set });
+    return { matchedCount: r.matchedCount, modifiedCount: r.modifiedCount };
   }
 
-  // Soft delete: just mark inactive.
-  // Datasets referencing it keep working — they just can't be
-  // newly assigned this taxonomy.
+  /** Soft delete. */
   static async deactivate(id, userId) {
+    const oid = toOid(id);
+    if (!oid) return { matchedCount: 0 };
     return this.collection().updateOne(
-      { _id: new ObjectId(id) },
+      { _id: oid },
       {
         $set: {
           isActive: false,
           updatedAt: new Date(),
-          updatedBy: new ObjectId(userId),
+          updatedBy: userId ? toOid(userId) : null,
         },
       },
     );
   }
 
-  // Hard delete (only allowed if no datasets reference it).
   static async deleteById(id) {
-    return this.collection().deleteOne({ _id: new ObjectId(id) });
+    const oid = toOid(id);
+    if (!oid) return { deletedCount: 0 };
+    const r = await this.collection().deleteOne({ _id: oid });
+    return { deletedCount: r.deletedCount };
   }
 
-  // Safety check for hard-delete: how many datasets use this taxonomy?
+  /** How many datasets reference this taxonomy. */
   static async countDatasetsUsing(taxonomyId) {
-    const db = getDB();
-    return db.collection("datasets").countDocuments({
-      taxonomyId: new ObjectId(taxonomyId),
-    });
+    const oid = toOid(taxonomyId);
+    if (!oid) return 0;
+    return getDB().collection("datasets").countDocuments({ taxonomyId: oid });
   }
 }
 

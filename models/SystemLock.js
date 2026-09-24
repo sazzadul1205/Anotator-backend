@@ -1,9 +1,9 @@
 // models/SystemLock.js
-// Handles the "system_locks" collection — tiny distributed locks.
-// Currently used ONLY for bootstrap: it guarantees that even if two
-// requests try to create the first admin at the same time, only one wins.
+// Tiny distributed locks. Used by bootstrap to guarantee only one
+// admin is created even under concurrent requests.
 
 const { getDB } = require("../config/db");
+const { DuplicateKeyError } = require("./errors");
 
 const COLLECTION = "system_locks";
 
@@ -12,24 +12,35 @@ class SystemLock {
     return getDB().collection(COLLECTION);
   }
 
-  // Try to claim a lock by inserting a document with a fixed _id.
-  // If another request already claimed it, MongoDB's unique _id
-  // constraint throws error code 11000 — that's our "lock is taken" signal.
+  /**
+   * Try to claim a lock by inserting a doc with a fixed _id.
+   * Throws DuplicateKeyError if the lock is already held.
+   */
   static async claim(id) {
-    return this.collection().insertOne({
-      _id: id, // e.g. "admin_bootstrap"
-      claimedAt: new Date(),
-    });
+    try {
+      await this.collection().insertOne({
+        _id: id,
+        claimedAt: new Date(),
+      });
+      return { claimed: true };
+    } catch (err) {
+      if (err && err.code === 11000) {
+        throw new DuplicateKeyError("lock", id);
+      }
+      throw err;
+    }
   }
 
-  // Release the lock (called when the operation finishes or fails).
+  /** Release a lock. Idempotent. */
   static async release(id) {
-    return this.collection().deleteOne({ _id: id });
+    const r = await this.collection().deleteOne({ _id: id });
+    return { released: r.deletedCount > 0 };
   }
 
-  // Check whether a lock is currently held.
+  /** Check whether a lock is currently held. */
   static async exists(id) {
-    return this.collection().findOne({ _id: id });
+    const doc = await this.collection().findOne({ _id: id });
+    return !!doc;
   }
 }
 
