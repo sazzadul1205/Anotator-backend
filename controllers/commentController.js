@@ -95,7 +95,7 @@ async function getOne(req, res, next) {
 }
 
 /**
- * PATCH /api/comments/:id/text
+ * PATCH /api/comments/:id
  * Update only the comment's text.
  */
 async function updateText(req, res, next) {
@@ -146,7 +146,7 @@ async function getVersions(req, res, next) {
 }
 
 /**
- * POST /api/comments/:id/versions/:version/restore
+ * POST /api/comments/:id/restore/:version
  * Restore a previous version. Writes a new version snapshot.
  */
 async function restoreVersion(req, res, next) {

@@ -189,7 +189,7 @@ async function duplicate(req, res, next) {
 }
 
 /**
- * PATCH /api/datasets/:id/rename
+ * PATCH /api/datasets/:id
  */
 async function rename(req, res, next) {
   try {

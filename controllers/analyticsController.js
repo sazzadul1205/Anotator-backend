@@ -34,7 +34,7 @@ async function globalAnalytics(req, res, next) {
 }
 
 /**
- * GET /api/analytics/dataset/:id/export?format=jsonl|csv|xlsx&split=0.8,0.1,0.1
+ * GET /api/analytics/dataset/:id/export-ml?format=jsonl|csv|xlsx&split=0.8,0.1,0.1
  * Streams an ML-ready export of annotated comments.
  * All validation, splitting, and formatting lives in the service.
  */

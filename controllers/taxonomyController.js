@@ -33,7 +33,7 @@ async function getDefaults(req, res, next) {
 }
 
 /**
- * GET /api/taxonomies/dataset/:datasetId
+ * GET /api/taxonomies/for-dataset/:datasetId
  * Effective taxonomy for a dataset (custom or default).
  */
 async function getForDataset(req, res, next) {
@@ -110,7 +110,7 @@ async function remove(req, res, next) {
 }
 
 /**
- * POST /api/taxonomies/:id/datasets/:datasetId/assign
+ * PATCH /api/taxonomies/:id/assign/:datasetId
  * Attach a taxonomy to a dataset.
  */
 async function assignToDataset(req, res, next) {
@@ -127,7 +127,7 @@ async function assignToDataset(req, res, next) {
 }
 
 /**
- * DELETE /api/taxonomies/:id/datasets/:datasetId/unassign
+ * DELETE /api/taxonomies/:id/assign/:datasetId
  * Remove the taxonomy from a dataset.
  */
 async function unassignFromDataset(req, res, next) {

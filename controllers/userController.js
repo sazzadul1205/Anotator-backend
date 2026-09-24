@@ -60,7 +60,7 @@ async function update(req, res, next) {
 }
 
 /**
- * POST /api/users/:id/toggle-status
+ * PATCH /api/users/:id/status
  * Flip the user's isActive flag.
  */
 async function toggleStatus(req, res, next) {
