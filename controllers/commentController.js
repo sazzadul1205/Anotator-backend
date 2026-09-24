@@ -1,8 +1,13 @@
-const ExcelJS = require("exceljs");
-const commentService = require("../services/commentService");
-const Comment = require("../models/Comment");
-const { buildFilter } = commentService;
+// controllers/commentController.js
+// Thin HTTP wrappers around commentService.
+// No DB access, no filter building, no ObjectId.
 
+const commentService = require("../services/commentService");
+
+/**
+ * GET /api/comments
+ * Paginated list of comments, scoped by role.
+ */
 async function list(req, res, next) {
   try {
     const result = await commentService.listComments(req.query, req.user);
@@ -12,6 +17,10 @@ async function list(req, res, next) {
   }
 }
 
+/**
+ * POST /api/comments
+ * Create a new comment.
+ */
 async function create(req, res, next) {
   try {
     const result = await commentService.createComment(req.body, req.user);
@@ -21,6 +30,10 @@ async function create(req, res, next) {
   }
 }
 
+/**
+ * POST /api/comments/bulk-annotate
+ * Apply the same annotation to up to 200 comments.
+ */
 async function bulkAnnotate(req, res, next) {
   try {
     const result = await commentService.bulkAnnotate(req.body, req.user);
@@ -30,6 +43,10 @@ async function bulkAnnotate(req, res, next) {
   }
 }
 
+/**
+ * POST /api/comments/bulk-assign
+ * Assign or unassign up to 500 comments.
+ */
 async function bulkAssign(req, res, next) {
   try {
     const result = await commentService.bulkAssign(req.body, req.user);
@@ -39,100 +56,35 @@ async function bulkAssign(req, res, next) {
   }
 }
 
+/**
+ * GET /api/comments/export?format=csv|xlsx
+ * Streams CSV or XLSX of the filtered comments.
+ * The service returns { contentType, filename, body } — controller just sends.
+ */
 async function exportComments(req, res, next) {
   try {
     const format = (req.query.format || "csv").toLowerCase();
-    if (!["csv", "xlsx"].includes(format)) {
-      return res
-        .status(400)
-        .json({ success: false, error: "format must be csv or xlsx" });
-    }
+    const result = await commentService.exportComments({
+      query: req.query,
+      user: req.user,
+      format,
+    });
 
-    const filter = buildFilter(req.query);
-
-    if (req.user.role !== "admin") {
-      const db = require("../config/db").getDB();
-      const datasets = await db
-        .collection("datasets")
-        .find(
-          { assignedTo: new (require("mongodb").ObjectId)(req.user.userId) },
-          { projection: { _id: 1 } },
-        )
-        .toArray();
-      const allowedIds = datasets.map((d) => d._id);
-
-      if (filter.datasetId) {
-        if (!allowedIds.some((id) => id.equals(filter.datasetId))) {
-          return res
-            .status(403)
-            .json({ success: false, error: "Not assigned to you" });
-        }
-      } else {
-        filter.datasetId = { $in: allowedIds };
-      }
-    }
-
-    const comments = await Comment.findForExport(filter);
-
-    const header = [
-      "id",
-      "comment_text",
-      "sentiment",
-      "type",
-      "status",
-      "version",
-      "annotatedAt",
-    ];
-    const rows = comments.map((c) => [
-      c.sourceId,
-      c.commentText,
-      c.sentiment,
-      c.type,
-      c.status,
-      c.version,
-      c.annotatedAt ? new Date(c.annotatedAt).toISOString() : "",
-    ]);
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-
-    if (format === "csv") {
-      res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="comments-${timestamp}.csv"`,
-      );
-      const escapeCsv = (v) => {
-        let s = v === null || v === undefined ? "" : String(v);
-        if (/^[=+\-@]/.test(s)) s = "'" + s;
-        if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-        return s;
-      };
-      const lines = [
-        header.join(","),
-        ...rows.map((r) => r.map(escapeCsv).join(",")),
-      ];
-      return res.send("\uFEFF" + lines.join("\r\n"));
-    }
-
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("comments");
-    sheet.addRow(header);
-    rows.forEach((r) => sheet.addRow(r));
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    );
+    res.setHeader("Content-Type", result.contentType);
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="comments-${timestamp}.xlsx"`,
+      `attachment; filename="${result.filename}"`,
     );
-    await workbook.xlsx.write(res);
-    res.end();
+    res.send(result.body);
   } catch (err) {
     next(err);
   }
 }
 
+/**
+ * GET /api/comments/:id
+ * Fetch a single comment.
+ */
 async function getOne(req, res, next) {
   try {
     const comment = await commentService.getComment(req.params.id, req.user);
@@ -142,6 +94,10 @@ async function getOne(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/comments/:id/text
+ * Update only the comment's text.
+ */
 async function updateText(req, res, next) {
   try {
     const result = await commentService.updateCommentText(
@@ -155,6 +111,10 @@ async function updateText(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/comments/:id/annotate
+ * Save an annotation (sentiment and/or type and/or note).
+ */
 async function annotate(req, res, next) {
   try {
     const result = await commentService.annotateComment(
@@ -168,6 +128,10 @@ async function annotate(req, res, next) {
   }
 }
 
+/**
+ * GET /api/comments/:id/versions
+ * Paginated version history.
+ */
 async function getVersions(req, res, next) {
   try {
     const result = await commentService.getCommentVersions(
@@ -181,6 +145,10 @@ async function getVersions(req, res, next) {
   }
 }
 
+/**
+ * POST /api/comments/:id/versions/:version/restore
+ * Restore a previous version. Writes a new version snapshot.
+ */
 async function restoreVersion(req, res, next) {
   try {
     const targetVersion = parseInt(req.params.version, 10);
@@ -198,6 +166,10 @@ async function restoreVersion(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/comments/:id
+ * Delete a comment and its version history.
+ */
 async function remove(req, res, next) {
   try {
     const result = await commentService.deleteComment(req.params.id, req.user);

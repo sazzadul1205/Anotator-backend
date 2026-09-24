@@ -1,10 +1,14 @@
-const { ObjectId } = require("mongodb");
-const crypto = require("crypto");
+// controllers/datasetController.js
+// Thin HTTP wrappers around datasetService and importService.
+
 const datasetService = require("../services/datasetService");
 const importService = require("../services/importService");
-const Taxonomy = require("../models/Taxonomy");
-const { audit } = require("../utils/audit");
 
+/**
+ * POST /api/datasets/import
+ * Accepts a multipart file upload, validates it, creates the dataset
+ * record, and kicks off the background import.
+ */
 async function importDataset(req, res, next) {
   try {
     if (!req.file) {
@@ -19,9 +23,10 @@ async function importDataset(req, res, next) {
       : "xlsx";
 
     if (!["csv", "xlsx"].includes(fileType)) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Only .csv and .xlsx files allowed" });
+      return res.status(400).json({
+        success: false,
+        error: "Only .csv and .xlsx files allowed",
+      });
     }
     if (!req.file.buffer || req.file.buffer.length === 0) {
       return res
@@ -29,22 +34,28 @@ async function importDataset(req, res, next) {
         .json({ success: false, error: "Uploaded file is empty" });
     }
 
+    // Reject early if the import queue is full — before we touch the DB.
+    if (!importService.canAcceptImport()) {
+      return res.status(503).json({
+        success: false,
+        error: "Import queue is full. Try again shortly.",
+        queue: importService.importQueueSnapshot(),
+      });
+    }
+
+    // Dataset name from body or filename fallback
     let datasetName = "";
     if (typeof req.body.name === "string") {
       datasetName = req.body.name.trim();
     } else if (Array.isArray(req.body.name) && req.body.name.length > 0) {
       datasetName = String(req.body.name[0]).trim();
     }
-
     if (datasetName.length > 120) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "Dataset name must be 120 characters or fewer",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "Dataset name must be 120 characters or fewer",
+      });
     }
-
     if (!datasetName) {
       datasetName = originalName.replace(/\.(csv|xlsx)$/i, "");
     }
@@ -52,79 +63,34 @@ async function importDataset(req, res, next) {
     const dedupeStrategy =
       req.body.dedupeStrategy === "rename" ? "rename" : "skip";
 
-    let taxonomyId = null;
-    let taxonomyName = null;
-    if (req.body.taxonomyId) {
-      let tid;
-      try {
-        tid = new ObjectId(req.body.taxonomyId);
-      } catch {
-        tid = null;
-      }
-      if (!tid) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Invalid taxonomyId" });
-      }
-      const tax = await Taxonomy.findById(tid);
-      if (!tax || !tax.isActive) {
-        return res
-          .status(404)
-          .json({ success: false, error: "Taxonomy not found or inactive" });
-      }
-      taxonomyId = tid;
-      taxonomyName = tax.name;
-    }
-
-    const checksum = crypto
-      .createHash("sha256")
-      .update(req.file.buffer)
-      .digest("hex");
-    const uploadedBy = new ObjectId(req.user.userId);
-
-    const datasetId = await importService.createDatasetRecord({
-      name: datasetName,
-      originalFileName: originalName,
+    const result = await importService.startImport({
+      fileBuffer: req.file.buffer,
+      originalName,
       fileType,
-      checksum,
+      datasetName,
       dedupeStrategy,
-      taxonomyId,
-      taxonomyName,
-      uploadedBy,
-    });
-
-    await audit({
-      action: "dataset.import_started",
+      taxonomyId: req.body.taxonomyId || null,
+      uploadedBy: req.user.userId,
       actor: req.user,
-      targetType: "dataset",
-      targetId: datasetId.toString(),
-      metadata: {
-        fileName: originalName,
-        fileType,
-        checksum,
-        dedupeStrategy,
-        datasetName,
-        taxonomyId: taxonomyId ? taxonomyId.toString() : null,
-        taxonomyName,
-      },
     });
 
     res.status(202).json({
       success: true,
       message: "Import started. Poll the dataset to track progress.",
-      datasetId,
+      datasetId: result.datasetId,
       status: "pending",
-      name: datasetName,
-      taxonomyId: taxonomyId ? taxonomyId.toString() : null,
-      taxonomyName,
+      name: result.name,
+      taxonomyId: result.taxonomyId,
+      taxonomyName: result.taxonomyName,
     });
 
+    // Kick off background processing (fire-and-forget, queued).
     importService
       .processImportInBackground({
-        datasetId,
+        datasetId: result.datasetId,
         fileBuffer: req.file.buffer,
         originalName,
-        uploadedBy,
+        uploadedBy: req.user.userId,
         dedupeStrategy,
       })
       .catch((err) => console.error("uncaught background error:", err));
@@ -133,6 +99,10 @@ async function importDataset(req, res, next) {
   }
 }
 
+/**
+ * POST /api/datasets/preview
+ * Inspect an uploaded file without importing it.
+ */
 async function previewDataset(req, res, next) {
   try {
     if (!req.file) {
@@ -150,6 +120,9 @@ async function previewDataset(req, res, next) {
   }
 }
 
+/**
+ * GET /api/datasets/stats
+ */
 async function getStats(req, res, next) {
   try {
     const stats = await datasetService.getStats();
@@ -159,6 +132,9 @@ async function getStats(req, res, next) {
   }
 }
 
+/**
+ * GET /api/datasets
+ */
 async function list(req, res, next) {
   try {
     const datasets = await datasetService.listDatasets(req.query, req.user);
@@ -168,6 +144,9 @@ async function list(req, res, next) {
   }
 }
 
+/**
+ * GET /api/datasets/:id
+ */
 async function getOne(req, res, next) {
   try {
     const result = await datasetService.getDataset(req.params.id, req.user);
@@ -177,6 +156,9 @@ async function getOne(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/datasets/:id/assign
+ */
 async function assign(req, res, next) {
   try {
     const result = await datasetService.assignDataset(
@@ -190,6 +172,9 @@ async function assign(req, res, next) {
   }
 }
 
+/**
+ * POST /api/datasets/:id/duplicate
+ */
 async function duplicate(req, res, next) {
   try {
     const result = await datasetService.duplicateDataset(
@@ -203,6 +188,9 @@ async function duplicate(req, res, next) {
   }
 }
 
+/**
+ * PATCH /api/datasets/:id/rename
+ */
 async function rename(req, res, next) {
   try {
     const result = await datasetService.renameDataset(
@@ -216,6 +204,9 @@ async function rename(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/datasets/:id
+ */
 async function remove(req, res, next) {
   try {
     const result = await datasetService.deleteDataset(req.params.id, req.user);
