@@ -32,7 +32,6 @@ function escapeRegex(str) {
 function toMongoFilter(domain = {}) {
   const f = {};
 
-  // --- fix: support { ids: [...] } ---
   if (Array.isArray(domain.ids)) {
     f._id = { $in: domain.ids.map(toOid).filter(Boolean) };
   }
@@ -48,6 +47,11 @@ function toMongoFilter(domain = {}) {
   } else if (domain.datasetId) {
     const oid = toOid(domain.datasetId);
     if (oid) f.datasetId = oid;
+  }
+
+  // --- fix: support sourceId (used by createComment duplicate check) ---
+  if (domain.sourceId !== undefined) {
+    f.sourceId = String(domain.sourceId);
   }
 
   if (domain.status) {
@@ -156,7 +160,10 @@ class Comment {
   static async findMany(domainFilter, options = {}) {
     const mongoFilter = toMongoFilter(domainFilter);
     const page = Math.max(1, options.page || 1);
-    const limit = Math.min(200, Math.max(1, options.limit || 50));
+    // --- fix: HTTP-facing callers stay capped at 200; internal callers
+    // (duplication, delete, ML export) can opt into a higher cap. ---
+    const hardMax = options.internal === true ? 1_000_000 : 200;
+    const limit = Math.min(hardMax, Math.max(1, options.limit || 50));
     const skip = (page - 1) * limit;
     const sortBy = options.sortBy || "createdAt";
     const sortDir = options.sortDir === "asc" ? 1 : -1;
@@ -198,12 +205,17 @@ class Comment {
   }
 
   static async groupByField(datasetId, field) {
-    const oid = toOid(datasetId);
-    if (!oid) return [];
+    // --- fix: null datasetId means "all datasets" (used by global analytics) ---
+    const match = {};
+    if (datasetId) {
+      const oid = toOid(datasetId);
+      if (!oid) return [];
+      match.datasetId = oid;
+    }
 
     const rows = await this.collection()
       .aggregate([
-        { $match: { datasetId: oid } },
+        { $match: match },
         { $group: { _id: `$${field}`, count: { $sum: 1 } } },
       ])
       .toArray();
@@ -330,21 +342,26 @@ class Comment {
   static async insertMany(dtos) {
     if (!dtos || !dtos.length) return [];
 
-    // fix: keep _importIndex out of the stored doc
     const docs = dtos.map((dto) => dtoToDoc(dto));
     const indices = dtos.map((_, i) => i);
 
-    let result;
+    let insertedIds;
     try {
-      result = await this.collection().insertMany(docs, { ordered: false });
+      const result = await this.collection().insertMany(docs, { ordered: false });
+      insertedIds = result.insertedIds || {};
     } catch (err) {
-      result = (err && err.result) || { insertedIds: {} };
+      // --- fix: grab insertedIds from every shape the driver has used ---
+      insertedIds =
+        (err && err.result && err.result.insertedIds) ||
+        (err && err.insertedIds) ||
+        (err && err.writeErrors && err.writeErrors.insertedIds) ||
+        {};
     }
 
-    const insertedIds = result.insertedIds || {};
     const out = [];
     for (const [localIdx, oid] of Object.entries(insertedIds)) {
       const idx = Number(localIdx);
+      if (!Number.isInteger(idx)) continue;
       out.push({ id: oid.toString(), index: indices[idx] });
     }
     return out;
