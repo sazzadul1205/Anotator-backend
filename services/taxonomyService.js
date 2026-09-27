@@ -90,14 +90,8 @@ function validateAndNormalize(sentiment, type) {
 
 async function listTaxonomies(query, user) {
   const filter = {};
-  if (query.kind) {
-    if (!["sentiment", "type"].includes(query.kind)) {
-      const err = new Error("kind must be sentiment or type");
-      err.status = 400;
-      throw err;
-    }
-    filter.kind = query.kind;
-  }
+  // Note: the taxonomy schema has no `kind` field, so we ignore query.kind.
+  // Kept as a no-op so existing callers that pass ?kind=... don't break.
   if (user.role !== "admin") filter.isActive = true;
   else if (query.isActive !== undefined)
     filter.isActive = query.isActive === "true";
