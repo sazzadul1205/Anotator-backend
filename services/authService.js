@@ -39,7 +39,6 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
 
   let lockClaimed = false;
   try {
-    // Try to claim the bootstrap lock
     try {
       await SystemLock.claim(BOOTSTRAP_LOCK_ID);
       lockClaimed = true;
@@ -52,11 +51,8 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
       throw err;
     }
 
-    // Secondary check
     const adminCount = await User.countAdmins();
     if (adminCount > 0) {
-      await SystemLock.release(BOOTSTRAP_LOCK_ID);
-      lockClaimed = false;
       const e = new Error("Admin account already exists");
       e.status = 400;
       throw e;
@@ -81,7 +77,8 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
     });
 
     return { userId, message: "Admin account created successfully" };
-  } catch (err) {
+  } finally {
+    // --- fix: always release the lock, on success or failure ---
     if (lockClaimed) {
       try {
         await SystemLock.release(BOOTSTRAP_LOCK_ID);
@@ -89,7 +86,6 @@ async function bootstrapAdmin({ name, email, password, confirmPassword }) {
         // best effort
       }
     }
-    throw err;
   }
 }
 
