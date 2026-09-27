@@ -1,5 +1,13 @@
 const dns = require("dns");
-dns.setServers(["8.8.8.8"]);
+// --- fix: only override DNS if explicitly configured. Hard-coding
+// 8.8.8.8 breaks in private networks and where it's blocked. ---
+if (process.env.DNS_SERVERS) {
+  dns.setServers(
+    process.env.DNS_SERVERS.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
 
 const { MongoClient, ServerApiVersion } = require("mongodb");
 

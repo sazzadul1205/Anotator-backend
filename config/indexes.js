@@ -27,6 +27,7 @@ async function ensureIndexes(db) {
     db.collection("comment_versions").createIndex({ createdAt: -1 }),
 
     db.collection("datasets").createIndex({ assignedTo: 1 }),
+    db.collection("datasets").createIndex({ uploadedBy: 1 }),
     db.collection("datasets").createIndex({ createdAt: -1 }),
     db.collection("datasets").createIndex({ status: 1 }),
     db.collection("datasets").createIndex({ taxonomyId: 1 }),
