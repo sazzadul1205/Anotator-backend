@@ -510,7 +510,27 @@ async function _processImportInBackground({
  * bounded by MAX_CONCURRENT_IMPORTS. Rejects if the queue is full.
  */
 function processImportInBackground(args) {
-  return importQueue.run(() => _processImportInBackground(args));
+  return importQueue
+    .run(() => _processImportInBackground(args))
+    .catch(async (err) => {
+      // --- fix: if we couldn't even enqueue (queue full), the dataset
+      // would otherwise stay 'pending' forever. Mark it failed. ---
+      if (err && err.status === 503) {
+        try {
+          await Dataset.updateById(args.datasetId, {
+            status: "failed",
+            importError: "Import queue is full — please retry",
+            progress: { phase: "failed", updatedAt: new Date() },
+          });
+        } catch (e) {
+          console.error(
+            "[import] failed to mark dataset failed:",
+            e.message,
+          );
+        }
+      }
+      throw err;
+    });
 }
 
 module.exports = {

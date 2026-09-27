@@ -103,34 +103,48 @@ class Queue {
 
   async _execute(job) {
     const { fn, resolve, reject } = job;
+    let callerSettled = false;
 
-    // Wrap the job in a hard timeout so a hung job can't stall the queue.
-    let timer;
-    const timeoutPromise = new Promise((_, rej) => {
-      timer = setTimeout(() => {
-        this.stats.timedOut++;
-        rej(
-          Object.assign(
-            new Error(`[${this.name}] job exceeded ${this.jobTimeoutMs}ms`),
-            { status: 500 },
-          ),
-        );
-      }, this.jobTimeoutMs);
-    });
+    const settleCaller = (type, value) => {
+      if (callerSettled) return;
+      callerSettled = true;
+      if (type === "resolve") {
+        this.stats.completed++;
+        resolve(value);
+      } else {
+        this.stats.failed++;
+        reject(value);
+      }
+    };
+
+    const finish = () => {
+      this.running--;
+      setImmediate(() => this._drain());
+    };
+
+    const timer = setTimeout(() => {
+      this.stats.timedOut++;
+      settleCaller(
+        "reject",
+        Object.assign(
+          new Error(`[${this.name}] job exceeded ${this.jobTimeoutMs}ms`),
+          { status: 500 },
+        ),
+      );
+      // --- fix: do NOT free the slot here. Keep it occupied until fn()
+      // truly settles, otherwise timed-out jobs would let extra work start
+      // concurrently. The `finally` below handles the actual release. ---
+    }, this.jobTimeoutMs);
 
     try {
-      const result = await Promise.race([fn(), timeoutPromise]);
+      const result = await fn();
       clearTimeout(timer);
-      this.stats.completed++;
-      resolve(result);
+      settleCaller("resolve", result);
     } catch (err) {
       clearTimeout(timer);
-      this.stats.failed++;
-      reject(err);
+      settleCaller("reject", err);
     } finally {
-      this.running--;
-      // Kick the next job off the queue (async so we don't recurse deep)
-      setImmediate(() => this._drain());
+      finish();
     }
   }
 }

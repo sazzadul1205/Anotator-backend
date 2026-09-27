@@ -93,7 +93,12 @@ async function importDataset(req, res, next) {
         uploadedBy: req.user.userId,
         dedupeStrategy,
       })
-      .catch((err) => console.error("uncaught background error:", err));
+      .catch((err) => {
+        console.error(
+          `[import] dataset ${result.datasetId} rejected/failed:`,
+          err.message,
+        );
+      });
   } catch (err) {
     next(err);
   }
