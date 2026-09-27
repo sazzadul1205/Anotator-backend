@@ -63,8 +63,10 @@ async function listDatasets(query, user) {
 
   const includeCounts = query.includeCounts === "true";
 
+  // --- fix: always expose `_id` alias so the frontend sees a consistent shape ---
   if (!includeCounts) {
-    return Dataset.findMany(filter);
+    const datasets = await Dataset.findMany(filter);
+    return datasets.map((d) => ({ ...d, _id: d.id }));
   }
 
   const datasets = await Dataset.findManyWithCounts(filter);
@@ -78,7 +80,6 @@ async function listDatasets(query, user) {
     },
   }));
 }
-
 async function getDataset(id, user) {
   const dataset = await Dataset.findById(id);
   if (!dataset) {
@@ -183,9 +184,10 @@ async function duplicateDataset(id, name, actor) {
   });
 
   // Fetch all source comments + their versions, then remap ids
+  // inside duplicateDataset():
   const sourceComments = await Comment.findMany(
     { datasetId: source.id },
-    { page: 1, limit: 1_000_000 },
+    { page: 1, limit: 1_000_000, internal: true }, // <-- fix
   );
   const comments = sourceComments.comments;
 
@@ -302,9 +304,10 @@ async function deleteDataset(id, actor) {
   }
 
   // Delete comments + their versions first
+  // inside deleteDataset():
   const { comments } = await Comment.findMany(
     { datasetId: id },
-    { page: 1, limit: 1_000_000 },
+    { page: 1, limit: 1_000_000, internal: true }, // <-- fix
   );
   const commentIds = comments.map((c) => c.id);
 

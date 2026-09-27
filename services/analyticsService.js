@@ -424,7 +424,13 @@ async function _exportMLDataset({ datasetId, user, format, split }) {
 
   const { comments } = await Comment.findMany(
     { datasetId, status: "annotated" },
-    { page: 1, limit: 1_000_000, sortBy: "createdAt", sortDir: "asc" },
+    {
+      page: 1,
+      limit: 1_000_000,
+      sortBy: "createdAt",
+      sortDir: "asc",
+      internal: true, // <-- fix
+    },
   );
 
   if (comments.length === 0) {
