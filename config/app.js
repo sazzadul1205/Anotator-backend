@@ -77,9 +77,9 @@ function oneOf(name, allowed, fallback) {
 // ---------------------------------------------------------------------------
 
 /** Every provider key registered in config/storage/index.js. */
-const STORAGE_PROVIDERS = ["mongo", "json"];
+const STORAGE_PROVIDERS = ["mongo", "json", "sqlite", "mysql"];
 
-/** MongoDB stays the default; JSON is opt-in via DATA_PROVIDER=json. */
+/** MongoDB stays the default; every other provider is opt-in. */
 const DEFAULT_STORAGE_PROVIDER = "mongo";
 
 const rootDir = path.resolve(__dirname, "..");
@@ -115,6 +115,22 @@ const config = {
       // When true the store flushes after every mutation (crash-safe).
       // When false it batches writes for throughput.
       writeThrough: bool("JSON_WRITE_THROUGH", true),
+    },
+    sqlite: {
+      // Path to the database file. The parent directory is created on boot.
+      file: path.resolve(rootDir, str("SQLITE_FILE", "storage/annotator.sqlite")),
+    },
+    mysql: {
+      // Set MYSQL_URL, or the discrete parts below. MYSQL_URL wins.
+      url: str("MYSQL_URL"),
+      host: str("MYSQL_HOST", "127.0.0.1"),
+      port: int("MYSQL_PORT", 3306, { min: 1, max: 65535 }),
+      user: str("MYSQL_USER", "root"),
+      password: str("MYSQL_PASSWORD", ""),
+      database: str("MYSQL_DATABASE", "annotator_db"),
+      // Cap on pooled connections. Match this to the server's max_connections
+      // minus headroom, or the pool will queue behind itself.
+      connectionLimit: int("MYSQL_POOL_SIZE", 10, { min: 1, max: 100 }),
     },
   },
 
@@ -167,11 +183,21 @@ function collectProblems(cfg = config) {
     problems.push("CORS_ORIGIN is required in production");
   }
 
-  // Only demand Mongo credentials when Mongo is the selected provider.
+  // Only demand credentials for the provider that is actually selected, and
+  // name an escape hatch in the message so the fix is obvious.
   if (cfg.storage.provider === "mongo" && !cfg.storage.mongo.uri) {
     problems.push(
-      "MONGO_URI is required when DATA_PROVIDER=mongo (set DATA_PROVIDER=json to use the built-in JSON store)",
+      "MONGO_URI is required when DATA_PROVIDER=mongo " +
+        "(set DATA_PROVIDER=sqlite, json or mysql to avoid a database server)",
     );
+  }
+
+  if (cfg.storage.provider === "mysql" && !cfg.storage.mysql.url && !cfg.storage.mysql.user) {
+    problems.push("MYSQL_USER is required when DATA_PROVIDER=mysql");
+  }
+
+  if (cfg.storage.provider === "sqlite" && !cfg.storage.sqlite.file) {
+    problems.push("SQLITE_FILE is required when DATA_PROVIDER=sqlite");
   }
 
   if (!STORAGE_PROVIDERS.includes(cfg.storage.provider)) {

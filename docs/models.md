@@ -31,10 +31,15 @@
 provider. It is the "bulwark": everything above it sees one fixed API and
 cannot tell which provider is underneath.
 
-There are currently two implementations of that API — `models/mongo/` and
-`models/json/` — selected by `DATA_PROVIDER`. See
+There are currently **two** implementations of that API — `models/mongo/` and
+`models/document/` — selected by `DATA_PROVIDER`. See
 [`storage.md`](storage.md) for the full architecture. What follows describes
-the API itself, which is identical for both strategies.
+the API itself, which is identical for every provider.
+
+`models/mongo/` exists because MongoDB is the one driver with a different id
+type (`ObjectId`). The `json`, `sqlite` and `mysql` providers all speak the
+same document API over string ids, so they share `models/document/` and differ
+only in `config/storage/`.
 
 Rules the project follows (by convention — nothing enforces them automatically):
 
@@ -77,8 +82,8 @@ every consumer, so keep this folder clean.
 
 ## 2. The repeated patterns
 
-Every adapter — in both `models/mongo/` and `models/json/` — is built from the
-same five pieces. Once you understand them, you can read any model file
+Every adapter — in both `models/mongo/` and `models/document/` — is built from
+the same five pieces. Once you understand them, you can read any model file
 quickly.
 
 ### 2.1 `static collection()`
@@ -391,8 +396,9 @@ dies mid-bootstrap, the lock row stays behind (the service releases it in a
 Declared once in `config/storage/schema.js` and applied on every boot by
 `ensureSchema()` on the active provider (and by `npm run init-indexes`). On
 MongoDB, creating an existing index is a no-op, so the call is safe to repeat;
-on the JSON provider the unique entries are enforced in code on every write and
-the rest are ignored. See [`storage.md`](storage.md) §5.3.
+on the SQL providers the same declaration becomes `CREATE TABLE` plus real
+indexes; on the JSON provider the unique entries are enforced in code on every
+write and the rest are ignored. See [`storage.md`](storage.md) §5.3.
 
 | Collection | Index | Serves |
 | --- | --- | --- |
@@ -462,11 +468,11 @@ behaviour above. These are observations from the code, not wishes.
    inconsistent.
 10. **No transactions anywhere.** Cascades (dataset delete → comments → versions)
      are three separate round-trips: a crash in the middle leaves orphans. This
-     is true on both providers, so switching to JSON does not make it worse.
-11. **Sort order is only as stable as the sort key.** Neither provider
-     guarantees an order for equal keys, and the JSON store's tie-break
-     (insertion order) is not the same as MongoDB's. Code that depends on the
-     order of equal-keyed rows is relying on unspecified behaviour — add a
+     is true on every provider, so switching away from MongoDB does not make it
+     worse.
+11. **Sort order is only as stable as the sort key.** No provider guarantees an
+     order for equal keys, and each engine breaks ties its own way. Code that
+     depends on the order of tied documents is a bug on all of them — add a
      unique tiebreaker to the sort if the order matters.
 
 ---

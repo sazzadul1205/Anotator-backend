@@ -11,16 +11,16 @@
 //   await storage.close();             // graceful shutdown
 //
 // Which provider runs is decided once, at load time, by DATA_PROVIDER. Adding
-// a third provider (Postgres, SQLite, …) means adding one file and one line
-// to PROVIDERS — no changes anywhere else.
+// a provider (Postgres, …) means adding one file and one line to PROVIDERS —
+// no changes anywhere else.
 
 const { config, STORAGE_PROVIDERS, DEFAULT_STORAGE_PROVIDER } = require("../app");
 
 /**
  * Registry of available strategies.
  * Key      — the value accepted in DATA_PROVIDER.
- * load     — lazy so an unused provider is never required (and MongoDB's
- *            driver is never loaded when running on JSON).
+ * load     — lazy so an unused provider is never required (and no driver is
+ *            ever loaded when running on sqlite or json).
  */
 const PROVIDERS = {
   mongo: {
@@ -29,6 +29,14 @@ const PROVIDERS = {
   },
   json: {
     load: () => require("./json"),
+    requiredEnv: [],
+  },
+  sqlite: {
+    load: () => require("./sqlite"),
+    requiredEnv: [],
+  },
+  mysql: {
+    load: () => require("./mysql"),
     requiredEnv: [],
   },
 };

@@ -1,5 +1,5 @@
-// models/json/AuditLog.js
-// JSON-provider implementation of the AuditLog model — append-only action log.
+// models/document/AuditLog.js
+// Document-store implementation of the AuditLog model — append-only action log.
 
 const storage = require("../../config/storage");
 const { stringIds } = require("../shared/ids");

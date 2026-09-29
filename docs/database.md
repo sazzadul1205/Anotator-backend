@@ -6,10 +6,11 @@
 **Database name:** configurable via `DB_NAME` (default `annotator_db`)
 
 The collection and document shapes below are the **logical schema**, shared by
-both providers. This document describes MongoDB's representation of it
-(`_id: ObjectId`, real indexes, aggregation pipelines). The JSON provider
-stores the same documents in files with string ids and enforces the unique
-constraints in code; see [`storage.md`](storage.md) §5.4–5.5.
+every provider. This document describes MongoDB's representation of it
+(`_id: ObjectId`, real indexes, aggregation pipelines). The `json`, `sqlite`
+and `mysql` providers store the same documents with string ids; the SQL ones in
+real tables with typed columns, the JSON one in files with the unique
+constraints enforced in code. See [`storage.md`](storage.md) §5.4–5.7.
 
 Every document uses Mongo's native `_id: ObjectId` unless noted.
 

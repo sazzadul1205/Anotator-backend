@@ -7,13 +7,18 @@
 // exist, and the only place the switch is expressed:
 //
 //     const models = require("./models");            // chosen by DATA_PROVIDER
-//     const { Comment, Dataset, User } = models;
-//
+//     const { Comment, Dataset, User } = models;//
 // Selecting a strategy is three steps, and step 1 is all that ever changes
 // between providers:
-//   1. DATA_PROVIDER selects a folder below (mongo | json)
-//   2. that folder is required lazily, so an unused driver is never loaded
+//   1. DATA_PROVIDER selects a strategy below
+//   2. that strategy is required lazily, so an unused driver is never loaded
 //   3. the loaded models are checked against models/contract.js
+//
+// There are only two model implementations, not four. Mongo needs its own
+// because it is the one driver with a different id type (ObjectId). The json,
+// sqlite and mysql providers all speak the same document API over string ids,
+// so they share models/document/ — the difference between them lives entirely
+// in config/storage/.
 //
 // `verifyContract()` is not ceremony: it is what makes adding a method to one
 // provider and forgetting the other a boot-time error instead of a 500 in
@@ -25,7 +30,9 @@ const { verifyContract } = require("./contract");
 /** Strategy registry. Key must match a DATA_PROVIDER value. */
 const STRATEGIES = {
   mongo: () => require("./mongo"),
-  json: () => require("./json"),
+  json: () => require("./document"),
+  sqlite: () => require("./document"),
+  mysql: () => require("./document"),
 };
 
 let models = null;

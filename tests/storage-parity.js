@@ -1,14 +1,17 @@
 // tests/storage-parity.js
-// Verifies that the model layer really is a bulwark: the MongoDB strategy and
-// the JSON strategy must be observationally identical for every operation the
-// application performs.
+// Verifies that the model layer really is a bulwark: every storage strategy
+// must be observationally identical for every operation the application
+// performs.
 //
 //   node tests/storage-parity.js
 //
-// The MongoDB half is skipped automatically when no MONGO_URI is configured,
-// so the suite is still useful on a machine with no database running:
-//   node tests/storage-parity.js            # JSON only
-//   MONGO_URI=... node tests/storage-parity.js   # both
+// The same scenario runs against json, sqlite, mongo and mysql, and the
+// transcripts are compared pairwise. Providers that are not available in the
+// current environment are skipped rather than failed, so the suite is still
+// useful on a machine with no database running:
+//   node tests/storage-parity.js                    # json + sqlite
+//   MONGO_URI=... node tests/storage-parity.js      # + mongo
+//   (with a MySQL server on 3306)                    # + mysql
 //
 // Exit code is 0 on success, 1 on any mismatch.
 
@@ -49,6 +52,28 @@ function assertSameSet(actual, expected, message) {
   const b = [...expected].map(key).sort();
   assert.deepStrictEqual(a, b, message);
 }
+
+/**
+ * Results whose *order* is not part of the contract, compared as sets.
+ *
+ * MongoDB specifies no ordering for `$group` output or for the documents
+ * returned by an `$in` match, and no SQL engine promises the same. Asserting
+ * an order here would be asserting an accident of each engine's planner, not a
+ * guarantee the application relies on — and would fail the day a new provider
+ * or a different MySQL index was used.
+ */
+const UNORDERED_RESULTS = new Set([
+  // $group output order is unspecified.
+  "groupBySentiment",
+  "groupByStatus",
+  "groupByGlobal",
+  "groupByInvalid",
+  "topByCommentCount",
+  "datasetCountByStatus",
+  // An $in match returns matching documents in engine-chosen order. The only
+  // caller of findManyByIds checks the count and membership, never the order.
+  "findManyByIds",
+]);
 
 // ---------------------------------------------------------------------------
 // Provider harnesses
@@ -480,10 +505,14 @@ async function runScenario(models) {
 // Environment setup
 // ---------------------------------------------------------------------------
 
-/** Points config.app at a throwaway directory before anything reads it. */
-async function useJsonStoreIn(dir) {
-  process.env.DATA_PROVIDER = "json";
-  process.env.JSON_DATA_DIR = dir;
+/**
+ * Reloads config/storage with DATA_PROVIDER set. The caller is responsible for
+ * making sure the target is a throwaway database or file: the scenario below
+ * deletes every collection it can reach.
+ */
+async function useProvider(env) {
+  process.env.DATA_PROVIDER = env.provider;
+  Object.assign(process.env, env.vars || {});
   process.env.JWT_SECRET = "parity-test-secret-that-is-long-enough-32";
   delete require.cache[require.resolve("../config/app")];
   delete require.cache[require.resolve("../config/storage")];
@@ -491,15 +520,43 @@ async function useJsonStoreIn(dir) {
   return require("../config/storage");
 }
 
-async function useMongoStore(dbName) {
-  process.env.DATA_PROVIDER = "mongo";
-  // A throwaway database, never the one the app uses. The scenario below
-  // deletes every collection, so it must not be pointed at real data.
-  process.env.DB_NAME = dbName;
-  delete require.cache[require.resolve("../config/app")];
-  delete require.cache[require.resolve("../config/storage")];
-  require("../config/app");
-  return require("../config/storage");
+/**
+ * Loads the model classes for a provider *after* config/storage has been
+ * swapped, so their `require("../../config/storage")` binds to the current
+ * provider. The cache is cleared first, because a model required for an
+ * earlier provider would otherwise keep a reference to that one.
+ */
+function loadModels(provider) {
+  const dir = path.resolve(
+    __dirname,
+    "..",
+    "models",
+    provider === "mongo" ? "mongo" : "document",
+  );
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(dir + path.sep)) delete require.cache[key];
+  }
+  return require(dir);
+}
+
+/** True when a MySQL server answers. Used to skip rather than fail. */
+async function mysqlReachable() {
+  try {
+    const mysql = require("mysql2/promise");
+    const { config } = require("../config/app");
+    const c = config.storage.mysql;
+    const admin = await mysql.createConnection({
+      host: c.url ? new URL(c.url).hostname : c.host,
+      port: c.url ? Number(new URL(c.url).port) || 3306 : c.port,
+      user: c.url ? decodeURIComponent(new URL(c.url).username) : c.user,
+      password: c.url ? decodeURIComponent(new URL(c.url).password) : c.password,
+      connectTimeout: 3000,
+    });
+    await admin.end();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,59 +566,101 @@ async function useMongoStore(dbName) {
 async function main() {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "annotator-parity-"));
 
-  console.log("\n=== JSON strategy: full scenario ===\n");
-  const jsonDir = path.join(tmpRoot, "json");
-  const jsonStorage = await useJsonStoreIn(jsonDir);
-  await jsonStorage.init();
-  const jsonModels = require("../models/json");
-  // Contract must hold for the JSON strategy too.
-  CONTRACT.verifyContract({ ...jsonModels, __providerName: "json" });
-  const jsonRun = await runScenario(jsonModels);
-  await jsonStorage.close();
+  // The document models back three providers (json, sqlite, mysql); mongo has
+  // its own because of ObjectId. Each is run through the identical scenario
+  // and the transcripts are compared, so any provider can be the reference.
+  const targets = [
+    { name: "json", env: { provider: "json", vars: { JSON_DATA_DIR: path.join(tmpRoot, "json") } } },
+    { name: "sqlite", env: { provider: "sqlite", vars: { SQLITE_FILE: path.join(tmpRoot, "parity.sqlite") } } },
+  ];
 
-  console.log("\n=== Contract: both strategies expose the same surface ===\n");
-  for (const name of CONTRACT.MODEL_NAMES) {
-    const jsonMethods = Object.keys(CONTRACT.CONTRACT[name]).length
-      ? CONTRACT.CONTRACT[name]
-      : CONTRACT.CONTRACT[name];
-    await test(`${name} implements its contract`, () => {
-      CONTRACT.verifyContract({ ...jsonModels, __providerName: "json" });
-      const gaps = jsonMethods.filter((m) => typeof jsonModels[name][m] !== "function");
-      assert.deepStrictEqual(gaps, []);
+  if (process.env.MONGO_URI) {
+    // A throwaway database, never the one the app uses. The scenario below
+    // deletes every collection, so it must not be pointed at real data.
+    targets.push({
+      name: "mongo",
+      env: { provider: "mongo", vars: { DB_NAME: "annotator_parity_test" } },
+      teardown: async (storage) => {
+        await storage.getStore().dropDatabase();
+      },
     });
+  } else {
+    console.log("\n  - MongoDB skipped (no MONGO_URI in this environment)\n");
   }
 
-  const mongoAvailable = Boolean(process.env.MONGO_URI);
-  if (!mongoAvailable) {
-    console.log(
-      "\n  - MongoDB strategy comparison skipped (no MONGO_URI in this environment)\n",
-    );
+  if (await mysqlReachable()) {
+    targets.push({
+      name: "mysql",
+      env: { provider: "mysql", vars: { MYSQL_DATABASE: "annotator_parity_test" } },
+      teardown: async (storage) => {
+        const { config } = require("../config/app");
+        const db = config.storage.mysql.database;
+        const mysql = require("mysql2/promise");
+        const c = config.storage.mysql;
+        const conn = await mysql.createConnection({
+          host: c.url ? new URL(c.url).hostname : c.host,
+          port: c.url ? Number(new URL(c.url).port) || 3306 : c.port,
+          user: c.url ? decodeURIComponent(new URL(c.url).username) : c.user,
+          password: c.url ? decodeURIComponent(new URL(c.url).password) : c.password,
+        });
+        await conn.query(`DROP DATABASE IF EXISTS \`${db}\``);
+        await conn.end();
+        void storage;
+      },
+    });
   } else {
-    console.log("\n=== MongoDB strategy: same scenario ===\n");
-    const PARITY_DB = "annotator_parity_test";
-    const mongoStorage = await useMongoStore(PARITY_DB);
-    await mongoStorage.init();
-    const mongoModels = require("../models/mongo");
-    CONTRACT.verifyContract({ ...mongoModels, __providerName: "mongo" });
+    console.log("\n  - MySQL skipped (no reachable server)\n");
+  }
 
-    // Start from a clean slate so both runs see identical inputs.
-    for (const name of Object.keys(COLLECTIONS)) {
-      await mongoStorage.getStore().collection(name).deleteMany({});
+  // --- run the scenario on every provider ---------------------------------
+  const runs = {};
+
+  for (const target of targets) {
+    console.log(`\n=== ${target.name} strategy: full scenario ===\n`);
+    const storage = await useProvider(target.env);
+    try {
+      await storage.init();
+    } catch (err) {
+      console.log(`  - ${target.name} unavailable: ${err.message}\n`);
+      continue;
     }
 
-    const mongoRun = await runScenario(mongoModels);
+    const models = loadModels(target.name);
+    CONTRACT.verifyContract({ ...models, __providerName: target.name });
 
-    // Remove the throwaway database so no residue is left behind.
-    await mongoStorage.getStore().dropDatabase();
-    await mongoStorage.close();
+    // Start from a clean slate so every run sees identical inputs.
+    for (const name of Object.keys(COLLECTIONS)) {
+      await storage.getStore().collection(name).deleteMany({});
+    }
 
-    console.log("\n=== Parity: JSON vs MongoDB ===\n");
-    for (const key of Object.keys(jsonRun)) {
-      await test(`parity: ${key}`, () => {
-        const a = jsonRun[key];
-        const b = mongoRun[key];
-        // Mongo's $group output order is unspecified; compare as sets there.
-        if (key.startsWith("groupBy") || key === "topByCommentCount" || key === "datasetCountByStatus") {
+    runs[target.name] = await runScenario(models);
+    if (target.teardown) await target.teardown(storage);
+    await storage.close();
+  }
+
+  // --- contract coverage ---------------------------------------------------
+  console.log("\n=== Contract: every strategy exposes the same surface ===\n");
+  for (const name of CONTRACT.MODEL_NAMES) {
+    for (const provider of Object.keys(runs)) {
+      await test(`${name}.${provider} implements its contract`, () => {
+        const models = loadModels(provider);
+        CONTRACT.verifyContract({ ...models, __providerName: provider });
+        const declared = CONTRACT.CONTRACT[name];
+        const gaps = declared.filter((m) => typeof models[name][m] !== "function");
+        assert.deepStrictEqual(gaps, []);
+      });
+    }
+  }
+
+  // --- parity --------------------------------------------------------------
+  const reference = Object.keys(runs)[0];
+  for (const provider of Object.keys(runs).slice(1)) {
+    console.log(`\n=== Parity: ${reference} vs ${provider} ===\n`);
+    for (const key of Object.keys(runs[reference])) {
+      await test(`parity[${provider}]: ${key}`, () => {
+        const a = runs[reference][key];
+        const b = runs[provider][key];
+        if (UNORDERED_RESULTS.has(key)) {
           assertSameSet(a, b, `${key} differs`);
         } else {
           assertSame(a, b, `${key} differs`);

@@ -65,6 +65,13 @@ const BASE = {
   PORT: undefined,
   RATE_LIMIT_GLOBAL: undefined,
   MAX_CONCURRENT_IMPORTS: undefined,
+  SQLITE_FILE: undefined,
+  MYSQL_URL: undefined,
+  MYSQL_HOST: undefined,
+  MYSQL_PORT: undefined,
+  MYSQL_USER: undefined,
+  MYSQL_PASSWORD: undefined,
+  MYSQL_DATABASE: undefined,
 };
 
 // ===========================================================================
@@ -84,6 +91,24 @@ selectionSuite.test("DATA_PROVIDER=json selects the JSON provider", () => {
   const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "json" });
   try {
     expect.equal(ctx.config.storage.provider, "json");
+  } finally {
+    ctx.restore();
+  }
+});
+
+selectionSuite.test("DATA_PROVIDER=sqlite selects the SQLite provider", () => {
+  const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "sqlite" });
+  try {
+    expect.equal(ctx.config.storage.provider, "sqlite");
+  } finally {
+    ctx.restore();
+  }
+});
+
+selectionSuite.test("DATA_PROVIDER=mysql selects the MySQL provider", () => {
+  const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "mysql" });
+  try {
+    expect.equal(ctx.config.storage.provider, "mysql");
   } finally {
     ctx.restore();
   }
@@ -142,14 +167,46 @@ requirementsSuite.test("MongoDB requires MONGO_URI; JSON does not", () => {
   }
 });
 
-requirementsSuite.test("the MONGO_URI error names the json escape hatch", () => {
+requirementsSuite.test("the MONGO_URI error names the server-free escape hatches", () => {
   const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "mongo" });
   try {
     const problem = ctx.collectProblems().find((p) => p.includes("MONGO_URI"));
     expect.ok(
-      problem.includes("DATA_PROVIDER=json"),
+      problem.includes("DATA_PROVIDER=sqlite"),
       "the message should tell you how to switch",
     );
+  } finally {
+    ctx.restore();
+  }
+});
+
+requirementsSuite.test("sqlite and mysql need nothing beyond the provider name", () => {
+  // Both must be fully usable with an empty environment: sqlite is a file,
+  // and MySQL falls back to the conventional local root/3306 credentials.
+  const sqlite = loadConfig({ ...BASE, DATA_PROVIDER: "sqlite" });
+  const mysql = loadConfig({ ...BASE, DATA_PROVIDER: "mysql" });
+  try {
+    expect.deep(sqlite.collectProblems(), [], "sqlite should need no variables");
+    expect.deep(mysql.collectProblems(), [], "mysql should need no variables");
+  } finally {
+    sqlite.restore();
+    mysql.restore();
+  }
+});
+
+requirementsSuite.test("each provider can be configured alongside the others", () => {
+  const ctx = loadConfig({
+    ...BASE,
+    DATA_PROVIDER: "sqlite",
+    MONGO_URI: "mongodb://x/y",
+    MYSQL_DATABASE: "other",
+    SQLITE_FILE: "custom/path.sqlite",
+  });
+  try {
+    expect.equal(ctx.config.storage.sqlite.file.endsWith("custom\\path.sqlite")
+      || ctx.config.storage.sqlite.file.endsWith("custom/path.sqlite"), true);
+    expect.equal(ctx.config.storage.mongo.uri, "mongodb://x/y");
+    expect.equal(ctx.config.storage.mysql.database, "other");
   } finally {
     ctx.restore();
   }
@@ -310,14 +367,35 @@ valuesSuite.test("both providers' settings can be configured at the same time", 
 
 const registrySuite = new Suite("config · storage registry");
 
-registrySuite.test("both providers are registered and both are loadable", () => {
+registrySuite.test("all four providers are registered", () => {
   const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "json" });
   try {
     delete require.cache[require.resolve(STORAGE_PATH)];
     const storage = require(STORAGE_PATH);
-    expect.deep(Object.keys(storage.PROVIDERS).sort(), ["json", "mongo"]);
-    expect.deep(storage.KNOWN_PROVIDERS.slice().sort(), ["json", "mongo"]);
+    const expected = ["json", "mongo", "mysql", "sqlite"];
+    expect.deep(Object.keys(storage.PROVIDERS).sort(), expected);
+    expect.deep(storage.KNOWN_PROVIDERS.slice().sort(), expected);
     expect.equal(storage.DEFAULT_PROVIDER, "mongo");
+  } finally {
+    ctx.restore();
+    delete require.cache[require.resolve(STORAGE_PATH)];
+  }
+});
+
+registrySuite.test("a SQL provider loads without pulling in the other drivers", () => {
+  // The point of the lazy registry: selecting sqlite must not require mysql2,
+  // and neither must require the mongodb driver.
+  const ctx = loadConfig({ ...BASE, DATA_PROVIDER: "sqlite" });
+  try {
+    delete require.cache[require.resolve(STORAGE_PATH)];
+    const storage = require(STORAGE_PATH);
+    const provider = storage.PROVIDERS.sqlite.load();
+    expect.equal(provider.name, "sqlite");
+    expect.deep(provider.requires, [], "sqlite should need no npm dependency");
+    expect.ok(
+      !Object.keys(require.cache).some((k) => k.includes("node_modules\\mysql2")),
+      "loading sqlite must not load mysql2",
+    );
   } finally {
     ctx.restore();
     delete require.cache[require.resolve(STORAGE_PATH)];

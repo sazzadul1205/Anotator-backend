@@ -420,7 +420,7 @@ Checklist that keeps the layering intact:
 
 1. **Need a new query?** Add a method to the relevant model first — no
    `ObjectId`, no `$operators`, no `storage.getStore()` in the service.
-   **Add it to both `models/mongo/` and `models/json/`**, and to the
+   **Add it to both `models/mongo/` and `models/document/`**, and to the
    `CONTRACT` map in `models/contract.js`; otherwise the next boot fails with
    a contract violation.
 2. **Validate** the payload and throw `Error` objects with `status: 400`

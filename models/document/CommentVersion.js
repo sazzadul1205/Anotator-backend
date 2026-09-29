@@ -1,5 +1,5 @@
-// models/json/CommentVersion.js
-// JSON-provider implementation of the CommentVersion model — the immutable
+// models/document/CommentVersion.js
+// Document-store implementation of the CommentVersion model — the immutable
 // history trail appended on every comment mutation.
 
 const storage = require("../../config/storage");

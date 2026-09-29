@@ -1,5 +1,5 @@
-// models/json/Dataset.js
-// JSON-provider implementation of the Dataset model.
+// models/document/Dataset.js
+// Document-store implementation of the Dataset model.
 //
 // The two aggregation helpers that Mongo solves with $lookup + $group
 // (findManyWithCounts, topByCommentCount) are resolved here with an in-process

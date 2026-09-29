@@ -77,8 +77,9 @@ contractSuite.test("the Mongo strategy satisfies the contract", () => {
   expect.deep(findGaps(models), []);
 });
 
-contractSuite.test("the JSON strategy satisfies the contract", () => {
-  const models = require(path.join(ROOT, "models", "json"));
+contractSuite.test("the document strategy satisfies the contract", () => {
+  // json, sqlite and mysql all select this one strategy.
+  const models = require(path.join(ROOT, "models", "document"));
   expect.deep(findGaps(models), []);
 });
 
@@ -86,7 +87,7 @@ contractSuite.test("the two strategies expose the same method names", () => {
   // Stronger than "both satisfy the list": a method on one and not the other
   // is exactly the drift this layer exists to prevent.
   const mongo = require(path.join(ROOT, "models", "mongo"));
-  const json = require(path.join(ROOT, "models", "json"));
+  const json = require(path.join(ROOT, "models", "document"));
   for (const model of MODEL_NAMES) {
     const mongoMethods = Object.getOwnPropertyNames(mongo[model])
       .filter((n) => typeof mongo[model][n] === "function" && n !== "constructor")

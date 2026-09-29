@@ -9,7 +9,9 @@
     "test": "node tests/run-all.js",
     "test:unit": "node tests/run-all.js --unit",
     "test:json": "node tests/run-all.js --json",
+    "test:sqlite": "node tests/run-all.js --sqlite",
     "test:mongo": "node tests/run-all.js --mongo",
+    "test:mysql": "node tests/run-all.js --mysql",
     "test:parity": "node tests/storage-parity.js",
     "test:api": "node tests/api-test.js",
     "init-indexes": "node scripts/init-indexes.js",
@@ -30,7 +32,8 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.9.5",
     "morgan": "^1.12.0",
-    "multer": "^2.3.0"
+    "multer": "^2.3.0",
+    "mysql2": "^3.24.4"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

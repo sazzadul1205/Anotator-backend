@@ -1,5 +1,5 @@
-// models/json/Taxonomy.js
-// JSON-provider implementation of the Taxonomy model — reusable label sets that
+// models/document/Taxonomy.js
+// Document-store implementation of the Taxonomy model — reusable label sets that
 // a dataset can reference.
 
 const storage = require("../../config/storage");

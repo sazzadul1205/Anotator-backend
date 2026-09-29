@@ -1,5 +1,5 @@
-// models/json/SystemLock.js
-// JSON-provider implementation of SystemLock.
+// models/document/SystemLock.js
+// Document-store implementation of SystemLock.
 //
 // Mutual exclusion is guaranteed by the single-threaded event loop: the
 // check-and-insert below cannot interleave with another request, so two

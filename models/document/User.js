@@ -1,5 +1,5 @@
-// models/json/User.js
-// JSON-provider implementation of the User model.
+// models/document/User.js
+// Document-store implementation of the User model.
 //
 // Method-for-method identical to models/mongo/User.js. The only differences
 // are mechanical:

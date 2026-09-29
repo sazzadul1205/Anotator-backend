@@ -1,16 +1,22 @@
 // tests/run-all.js
-// Runs the whole test matrix: unit suites, then the full end-to-end API suite
-// against BOTH storage providers, each in its own isolated environment.
+// Runs the whole test matrix: unit suites, the storage-parity suite, then the
+// full end-to-end API suite against EVERY storage provider, each in its own
+// isolated environment.
 //
-//   npm test                       # everything
-//   node tests/run-all.js --unit   # unit suites only (no server, no database)
-//   node tests/run-all.js --json   # end-to-end on the JSON provider only
-//   node tests/run-all.js --mongo  # end-to-end on MongoDB only
+//   npm test                          # everything available
+//   node tests/run-all.js --unit      # unit suites only (no server, no database)
+//   node tests/run-all.js --json      # end-to-end on JSON only
+//   node tests/run-all.js --mongo     # end-to-end on MongoDB only
+//   node tests/run-all.js --sqlite    # end-to-end on SQLite only
+//   node tests/run-all.js --mysql     # end-to-end on MySQL only
 //
 // Isolation is the important part. Each provider run gets a private port, a
-// private store, and — for MongoDB — a throwaway database that is dropped
-// afterwards. Your configured database, your local data directory, and any
-// server you already have running are never touched.
+// private store, and — for MongoDB and MySQL — a throwaway database that is
+// dropped afterwards. Your configured database, your local data directory, and
+// any server you already have running are never touched.
+//
+// Providers that are unavailable (no MONGO_URI, no MySQL server) are reported
+// as skipped rather than failed.
 //
 // Writes a machine-readable report to tests/results/.
 
@@ -32,14 +38,16 @@ const {
 
 const UNIT_SUITES = [
   { name: "json-store", script: "tests/unit/json-store.test.js" },
+  { name: "sql-store", script: "tests/unit/sql-store.test.js" },
   { name: "config", script: "tests/unit/config.test.js" },
   { name: "contract", script: "tests/unit/contract.test.js" },
 ];
 
+// Every provider the end-to-end matrix knows about.
+const ALL_PROVIDERS = ["json", "sqlite", "mongo", "mysql"];
+
 const args = new Set(process.argv.slice(2));
 const unitOnly = args.has("--unit");
-const onlyJson = args.has("--json");
-const onlyMongo = args.has("--mongo");
 const skipProviderSuites = unitOnly;
 
 const runId = Date.now().toString(36);
@@ -78,13 +86,12 @@ async function runUnitSuites() {
 // ---------------------------------------------------------------------------
 
 async function runParitySuite() {
-  process.stdout.write("\n▶ storage parity (JSON vs MongoDB)\n");
+  process.stdout.write("\n▶ storage parity (all providers)\n");
   const run = await runNode(path.join(ROOT, "tests/storage-parity.js"));
   process.stdout.write(run.stdout);
   if (run.stderr.trim()) process.stderr.write(run.stderr);
 
   const match = run.stdout.match(/=== (\d+) passed, (\d+) failed, (\d+) skipped ===/);
-  const skipped = run.stdout.includes("comparison skipped");
   const passed = match ? Number(match[1]) : 0;
   const failed = match ? Number(match[2]) : 0;
   return {
@@ -94,7 +101,6 @@ async function runParitySuite() {
     failed,
     total: passed + failed,
     skipped: match ? Number(match[3]) : 0,
-    mongoCompared: !skipped,
     ok: run.ok,
   };
 }
@@ -105,23 +111,33 @@ async function runParitySuite() {
 
 /**
  * Boots a real server against one provider in a throwaway environment and
- * runs the 55-check HTTP suite against it.
+ * runs the full HTTP suite against it.
+ *
+ * A provider that cannot run in this environment is reported as skipped, not
+ * failed: a machine with no MongoDB and no MySQL can still test json and
+ * sqlite completely.
  */
 async function runApiSuiteForProvider(provider) {
-  // A machine with no MONGO_URI can still test the JSON provider completely.
-  // Report the MongoDB run as skipped rather than failed.
-  if (provider === "mongo" && !process.env.MONGO_URI) {
-    process.stdout.write("\n▶ end-to-end API · mongo — SKIPPED (MONGO_URI not set)\n");
+  const skip = (reason) => {
+    process.stdout.write(`\n▶ end-to-end API · ${provider} — SKIPPED (${reason})\n`);
     return {
-      suite: "api:mongo",
+      suite: `api:${provider}`,
       kind: "e2e",
       provider,
       passed: 0,
       failed: 0,
       total: 0,
       skipped: true,
+      skipReason: reason,
       ok: true,
     };
+  };
+
+  if (provider === "mongo" && !process.env.MONGO_URI) {
+    return skip("MONGO_URI not set");
+  }
+  if (provider === "mysql" && !(await harness.mysqlReachable())) {
+    return skip("no MySQL server reachable");
   }
 
   const sandbox = await createSandbox(provider, { runId });
@@ -182,11 +198,11 @@ function renderSummary(reports) {
   );
   console.log(line("·"));
   for (const r of reports) {
-    const name = r.suite.padEnd(26);
     const kind = (kindLabel[r.kind] || r.kind).padEnd(12);
     const status = r.skipped ? "skipped" : String(r.passed);
+    const label = r.skipped && r.skipReason ? `${r.suite} (${r.skipReason})` : r.suite;
     console.log(
-      `${name}${kind}${status.padStart(8)}${String(r.failed).padStart(9)}`,
+      `${label.padEnd(26)}${kind.padEnd(12)}${status.padStart(8)}${String(r.failed).padStart(9)}`,
     );
   }
   console.log(line("·"));
@@ -246,8 +262,9 @@ async function writeReport(reports) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  if (unitOnly && (onlyJson || onlyMongo)) {
-    console.error("--unit cannot be combined with --json/--mongo");
+  const providerFlags = ALL_PROVIDERS.filter((p) => args.has(`--${p}`));
+  if (unitOnly && providerFlags.length) {
+    console.error(`--unit cannot be combined with ${providerFlags.map((p) => `--${p}`).join("/")}`);
     process.exit(2);
   }
 
@@ -264,12 +281,11 @@ async function main() {
   } else {
     reports.push(await runParitySuite());
 
-    const providers = [];
-    if (!onlyMongo) providers.push("json");
-    if (!onlyJson) providers.push("mongo");
+    const providers = providerFlags.length ? providerFlags : ALL_PROVIDERS;
     for (const provider of providers) {
       reports.push(await runApiSuiteForProvider(provider));
-    }  }
+    }
+  }
 
   renderSummary(reports);
   const file = await writeReport(reports);

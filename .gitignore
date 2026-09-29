@@ -28,5 +28,14 @@ coverage/
 # JSON storage provider data (DATA_PROVIDER=json)
 /data/
 
+# SQLite storage provider data (DATA_PROVIDER=sqlite), including the WAL
+# sidecar files SQLite keeps next to the database.
+# Anchored to the repo root: an unanchored "storage/" would also match
+# config/storage/, which is source code.
+/storage/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 /Build-Docs
 /tests/results

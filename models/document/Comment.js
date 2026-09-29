@@ -1,5 +1,5 @@
-// models/json/Comment.js
-// JSON-provider implementation of the Comment model.
+// models/document/Comment.js
+// Document-store implementation of the Comment model.
 //
 // Method-for-method identical to models/mongo/Comment.js. The aggregation
 // methods (groupByField, lengthHistogram) are computed in JavaScript instead
