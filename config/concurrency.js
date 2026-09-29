@@ -1,7 +1,7 @@
 // config/concurrency.js
-// Env-driven concurrency limiter with a FIFO queue.
+// Concurrency limiter with a FIFO queue, driven entirely by config/app.js.
 //
-// Env vars:
+// Env vars (declared once, in config/app.js):
 //   MAX_CONCURRENT_IMPORTS   — how many imports run at once (default 2)
 //   MAX_CONCURRENT_EXPORTS   — how many exports run at once (default 4)
 //   MAX_QUEUE_SIZE           — max pending jobs before rejecting (default 100)
@@ -12,18 +12,7 @@
 //   const imports = require("../config/concurrency").imports;
 //   await imports.run(async () => { ...do work... });
 
-function readInt(name, fallback, { min = 1, max = 100000 } = {}) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return fallback;
-  const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < min || n > max) {
-    console.warn(
-      `⚠️  ${name}="${raw}" is invalid; using default ${fallback} (range ${min}-${max})`,
-    );
-    return fallback;
-  }
-  return n;
-}
+const { config } = require("./app");
 
 class Queue {
   constructor({ name, concurrency, maxQueueSize, jobTimeoutMs }) {
@@ -153,34 +142,30 @@ class Queue {
 // Instances — one queue per class of work
 // ---------------------------------------------------------------------------
 
-const maxQueueSize = readInt("MAX_QUEUE_SIZE", 100, { min: 1, max: 10000 });
-const jobTimeoutMs = readInt("JOB_TIMEOUT_MS", 10 * 60 * 1000, {
-  min: 1000,
-  max: 24 * 60 * 60 * 1000,
-});
+const {
+  maxConcurrentImports,
+  maxConcurrentExports,
+  maxQueueSize,
+  jobTimeoutMs,
+  exportTimeoutMs,
+  logIntervalMs,
+} = config.queues;
 
 const imports = new Queue({
   name: "imports",
-  concurrency: readInt("MAX_CONCURRENT_IMPORTS", 2, { min: 1, max: 64 }),
+  concurrency: maxConcurrentImports,
   maxQueueSize,
   jobTimeoutMs,
 });
 
 const exports_ = new Queue({
   name: "exports",
-  concurrency: readInt("MAX_CONCURRENT_EXPORTS", 4, { min: 1, max: 64 }),
+  concurrency: maxConcurrentExports,
   maxQueueSize,
-  jobTimeoutMs: readInt("EXPORT_TIMEOUT_MS", 60 * 1000, {
-    min: 1000,
-    max: 10 * 60 * 1000,
-  }),
+  jobTimeoutMs: exportTimeoutMs,
 });
 
 // Optional: periodic queue-depth logging so you can see pressure in the logs.
-const logIntervalMs = readInt("QUEUE_LOG_INTERVAL_MS", 60000, {
-  min: 5000,
-  max: 60 * 60 * 1000,
-});
 if (logIntervalMs > 0) {
   setInterval(() => {
     if (imports.total === 0 && exports_.total === 0) return;
