@@ -25,10 +25,25 @@ function escapeRegex(str) {
  */
 const stringIds = {
   name: "string",
-  /** string -> storage representation, or null when the input is unusable. */
+  /**
+   * string -> storage representation, or null when the input is unusable.
+   *
+   * Only id-shaped primitives are accepted. A plain object or array is
+   * rejected rather than stringified: `String({ $in: [] })` is the truthy
+   * garbage `"[object Object]"`, which turns a malformed id into a filter that
+   * silently matches nothing. The Mongo adapter already rejects these (it
+   * cannot build an ObjectId from them), and the two strategies must agree —
+   * otherwise the same query returns everything on one provider and nothing on
+   * another.
+   */
   coerce(value) {
     if (value === null || value === undefined || value === "") return null;
-    return typeof value === "string" ? value : String(value);
+    if (typeof value === "string") return value;
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? String(value) : null;
+    }
+    if (typeof value === "bigint") return value.toString();
+    return null;
   },
   /** Is this input a well-formed id for this provider? */
   isValid(value) {
