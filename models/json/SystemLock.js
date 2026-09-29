@@ -1,15 +1,19 @@
-// models/SystemLock.js
-// Tiny distributed locks. Used by bootstrap to guarantee only one
-// admin is created even under concurrent requests.
+// models/json/SystemLock.js
+// JSON-provider implementation of SystemLock.
+//
+// Mutual exclusion is guaranteed by the single-threaded event loop: the
+// check-and-insert below cannot interleave with another request, so two
+// concurrent bootstraps can never both succeed. (The Mongo version relies on
+// the unique `_id` index instead; the observable behaviour is identical.)
 
-const { getDB } = require("../config/db");
-const { DuplicateKeyError } = require("./errors");
+const storage = require("../../config/storage");
+const { DuplicateKeyError } = require("../errors");
 
 const COLLECTION = "system_locks";
 
 class SystemLock {
   static collection() {
-    return getDB().collection(COLLECTION);
+    return storage.getStore().collection(COLLECTION);
   }
 
   /**
@@ -17,11 +21,11 @@ class SystemLock {
    * Throws DuplicateKeyError if the lock is already held.
    */
   static async claim(id) {
+    if (await this.exists(id)) {
+      throw new DuplicateKeyError("lock", id);
+    }
     try {
-      await this.collection().insertOne({
-        _id: id,
-        claimedAt: new Date(),
-      });
+      await this.collection().insertOne({ _id: id, claimedAt: new Date() });
       return { claimed: true };
     } catch (err) {
       if (err && err.code === 11000) {

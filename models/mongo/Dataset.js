@@ -1,105 +1,43 @@
-// models/Dataset.js
-// One document per imported file.
+// models/mongo/Dataset.js
+// MongoDB implementation of the Dataset model.
 
-const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db");
+const storage = require("../../config/storage");
+const { objectIds } = require("./oid");
+const { datasetToDTO } = require("../shared/dto");
+const { datasetFilter, sanitizePatch, DATASET_REF_FIELDS } = require("../shared/filters");
 
 const COLLECTION = "datasets";
 
-function toOid(id) {
-  if (!id) return null;
-  try {
-    return new ObjectId(id);
-  } catch {
-    return null;
-  }
-}
-
-function idStr(v) {
-  if (v === null) return null;
-  return typeof v === "string" ? v : v.toString();
-}
-
-function toDTO(doc) {
-  if (!doc) return null;
-  return {
-    id: idStr(doc._id),
-    name: doc.name,
-    originalFileName: doc.originalFileName,
-    fileType: doc.fileType,
-    sheetName: doc.sheetName ?? null,
-    checksum: doc.checksum,
-    totalRows: doc.totalRows,
-    importedRows: doc.importedRows,
-    skippedRows: doc.skippedRows,
-    renamedRows: doc.renamedRows || 0,
-    dedupeStrategy: doc.dedupeStrategy || "skip",
-    status: doc.status,
-    importError: doc.importError ?? null,
-    importErrors: doc.importErrors || [],
-    progress: doc.progress || null,
-    taxonomyId: idStr(doc.taxonomyId),
-    taxonomyName: doc.taxonomyName ?? null,
-    taxonomyAssignedAt: doc.taxonomyAssignedAt ?? null,
-    uploadedBy: idStr(doc.uploadedBy),
-    assignedTo: idStr(doc.assignedTo),
-    assignedAt: doc.assignedAt ?? null,
-    duplicatedFrom: idStr(doc.duplicatedFrom),
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  };
-}
-
-function toMongoFilter(domain = {}) {
-  const f = {};
-  if (domain.status) f.status = domain.status;
-  if (domain.assignedTo) f.assignedTo = toOid(domain.assignedTo);
-  if (domain.uploadedBy) f.uploadedBy = toOid(domain.uploadedBy);
-  if (domain.taxonomyId) f.taxonomyId = toOid(domain.taxonomyId);
-  return f;
-}
-
-function patchToSet(patch) {
-  const set = { ...patch };
-  delete set.id;
-  delete set._id;
-  for (const k of [
-    "assignedTo",
-    "uploadedBy",
-    "taxonomyId",
-    "duplicatedFrom",
-  ]) {
-    if (k in set) set[k] = set[k] ? toOid(set[k]) : null;
-  }
-  return set;
-}
+const EMPTY_SUMMARY = { total: 0, annotated: 0, pending: 0 };
 
 class Dataset {
   static collection() {
-    return getDB().collection(COLLECTION);
+    return storage.getStore().collection(COLLECTION);
   }
 
   // --- Reads ---------------------------------------------------------------
 
   static async findById(id) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return null;
     const doc = await this.collection().findOne({ _id: oid });
-    return toDTO(doc);
+    return datasetToDTO(doc);
   }
 
   static async findOne(domainFilter) {
-    const doc = await this.collection().findOne(toMongoFilter(domainFilter));
-    return toDTO(doc);
+    const doc = await this.collection().findOne(
+      datasetFilter(domainFilter, objectIds),
+    );
+    return datasetToDTO(doc);
   }
 
   /** List datasets, newest first. */
   static async findMany(domainFilter = {}) {
     const docs = await this.collection()
-      .find(toMongoFilter(domainFilter))
+      .find(datasetFilter(domainFilter, objectIds))
       .sort({ createdAt: -1 })
       .toArray();
-    return docs.map(toDTO);
+    return docs.map(datasetToDTO);
   }
 
   /**
@@ -109,7 +47,7 @@ class Dataset {
   static async findManyWithCounts(domainFilter = {}) {
     const docs = await this.collection()
       .aggregate([
-        { $match: toMongoFilter(domainFilter) },
+        { $match: datasetFilter(domainFilter, objectIds) },
         { $sort: { createdAt: -1 } },
         {
           $lookup: {
@@ -136,10 +74,7 @@ class Dataset {
         {
           $addFields: {
             summary: {
-              $ifNull: [
-                { $arrayElemAt: ["$counts", 0] },
-                { total: 0, annotated: 0, pending: 0 },
-              ],
+              $ifNull: [{ $arrayElemAt: ["$counts", 0] }, EMPTY_SUMMARY],
             },
           },
         },
@@ -148,7 +83,7 @@ class Dataset {
       .toArray();
 
     return docs.map((doc) => ({
-      ...toDTO(doc),
+      ...datasetToDTO(doc),
       summary: {
         total: doc.summary.total,
         annotated: doc.summary.annotated,
@@ -159,7 +94,7 @@ class Dataset {
 
   /** Ids (strings) of datasets assigned to a user. */
   static async findAssignedToIds(userId) {
-    const oid = toOid(userId);
+    const oid = objectIds.coerce(userId);
     if (!oid) return [];
     const docs = await this.collection()
       .find({ assignedTo: oid }, { projection: { _id: 1 } })
@@ -172,32 +107,25 @@ class Dataset {
   /** Create a dataset. Returns { id }. */
   static async create(dto) {
     const now = new Date();
-    const doc = {
-      ...dto,
-      taxonomyId: dto.taxonomyId ? toOid(dto.taxonomyId) : null,
-      uploadedBy: dto.uploadedBy ? toOid(dto.uploadedBy) : null,
-      assignedTo: dto.assignedTo ? toOid(dto.assignedTo) : null,
-      duplicatedFrom: dto.duplicatedFrom ? toOid(dto.duplicatedFrom) : null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    delete doc.id;
+    const doc = sanitizePatch(dto, objectIds, DATASET_REF_FIELDS);
+    doc.createdAt = now;
+    doc.updatedAt = now;
     const r = await this.collection().insertOne(doc);
     return { id: r.insertedId.toString() };
   }
 
   /** Update a dataset by id. Returns { matchedCount, modifiedCount }. */
   static async updateById(id, patch) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { matchedCount: 0, modifiedCount: 0 };
-    const set = { ...patchToSet(patch), updatedAt: new Date() };
+    const set = { ...sanitizePatch(patch, objectIds, DATASET_REF_FIELDS), updatedAt: new Date() };
     const r = await this.collection().updateOne({ _id: oid }, { $set: set });
     return { matchedCount: r.matchedCount, modifiedCount: r.modifiedCount };
   }
 
   /** Replace the whole progress object. Used by the importer. */
   static async updateProgress(id, progress) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { matchedCount: 0 };
     return this.collection().updateOne(
       { _id: oid },
@@ -212,7 +140,7 @@ class Dataset {
 
   /** Bump only progress.processed and timestamps. */
   static async setProgressProcessed(id, processed) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { matchedCount: 0 };
     return this.collection().updateOne(
       { _id: oid },
@@ -226,21 +154,29 @@ class Dataset {
     );
   }
 
-  /** Remove taxonomy fields (used by unassignFromDataset). */
+  /**
+   * Remove taxonomy fields (used by unassignFromDataset).
+   * Values are set to null rather than unset so DTO mappers always see a
+   * defined value, and document shape stays uniform across all datasets.
+   */
   static async clearTaxonomy(id) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { matchedCount: 0 };
     return this.collection().updateOne(
       { _id: oid },
       {
-        $unset: { taxonomyId: "", taxonomyName: "", taxonomyAssignedAt: "" },
-        $set: { updatedAt: new Date() },
+        $set: {
+          taxonomyId: null,
+          taxonomyName: null,
+          taxonomyAssignedAt: null,
+          updatedAt: new Date(),
+        },
       },
     );
   }
 
   static async deleteById(id) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { deletedCount: 0 };
     const r = await this.collection().deleteOne({ _id: oid });
     return { deletedCount: r.deletedCount };
@@ -261,7 +197,7 @@ class Dataset {
   }
 
   static async countAssignedTo(userId) {
-    const oid = toOid(userId);
+    const oid = objectIds.coerce(userId);
     if (!oid) return 0;
     return this.collection().countDocuments({ assignedTo: oid });
   }
@@ -295,10 +231,7 @@ class Dataset {
         {
           $addFields: {
             summary: {
-              $ifNull: [
-                { $arrayElemAt: ["$counts", 0] },
-                { total: 0, annotated: 0 },
-              ],
+              $ifNull: [{ $arrayElemAt: ["$counts", 0] }, { total: 0, annotated: 0 }],
             },
           },
         },

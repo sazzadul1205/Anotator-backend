@@ -1,133 +1,25 @@
-// models/Comment.js
-// Handles the "comments" collection.
+// models/mongo/Comment.js
+// MongoDB implementation of the Comment model.
+//
+// The structure mirrors models/json/Comment.js method-for-method. Anything
+// that is *not* about talking to Mongo — DTO shape, filter semantics, patch
+// sanitising — is imported from ../shared so the two providers cannot drift.
 
-const { ObjectId } = require("mongodb");
-const { getDB } = require("../config/db");
-const { DuplicateKeyError, ValidationError } = require("./errors");
+const storage = require("../../config/storage");
+const { objectIds } = require("./oid");
+const {
+  commentToDTO,
+} = require("../shared/dto");
+const {
+  commentFilter,
+  dtoToDocument,
+  sanitizePatch,
+  COMMENT_REF_FIELDS,
+  COMMENT_DOC_REF_FIELDS,
+} = require("../shared/filters");
+const { DuplicateKeyError, ValidationError } = require("../errors");
 
 const COLLECTION = "comments";
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-function toOid(id) {
-  if (!id) return null;
-  try {
-    return new ObjectId(id);
-  } catch {
-    return null;
-  }
-}
-
-function idStr(v) {
-  if (v === null) return null;
-  return typeof v === "string" ? v : v.toString();
-}
-
-function escapeRegex(str) {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function toMongoFilter(domain = {}) {
-  const f = {};
-
-  if (Array.isArray(domain.ids)) {
-    f._id = { $in: domain.ids.map(toOid).filter(Boolean) };
-  }
-
-  if (Array.isArray(domain.datasetIds)) {
-    const allowed = domain.datasetIds.map(toOid).filter(Boolean);
-    if (domain.datasetId) {
-      const oid = toOid(domain.datasetId);
-      f.datasetId = allowed.some((a) => a.equals(oid)) ? oid : { $in: [] };
-    } else {
-      f.datasetId = { $in: allowed };
-    }
-  } else if (domain.datasetId) {
-    const oid = toOid(domain.datasetId);
-    if (oid) f.datasetId = oid;
-  }
-
-  // --- fix: support sourceId (used by createComment duplicate check) ---
-  if (domain.sourceId !== undefined) {
-    f.sourceId = String(domain.sourceId);
-  }
-
-  if (domain.status) {
-    f.status = domain.status;
-  } else if (domain.excludeAnnotated) {
-    f.status = { $ne: "annotated" };
-  }
-
-  if (domain.sentiment) f.sentiment = domain.sentiment;
-  if (domain.type) f.type = domain.type;
-
-  if (domain.assignedTo !== undefined) {
-    f.assignedTo = domain.assignedTo === null ? null : toOid(domain.assignedTo);
-  }
-
-  if (domain.search) {
-    const trimmed = String(domain.search).trim().slice(0, 100);
-    if (trimmed) {
-      f.commentText = { $regex: escapeRegex(trimmed), $options: "i" };
-    }
-  }
-
-  return f;
-}
-
-function toDTO(doc) {
-  if (!doc) return null;
-  return {
-    id: idStr(doc._id),
-    datasetId: idStr(doc.datasetId),
-    sourceId: doc.sourceId,
-    commentText: doc.commentText,
-    sentiment: doc.sentiment,
-    type: doc.type,
-    status: doc.status,
-    assignedTo: idStr(doc.assignedTo),
-    assignedAt: doc.assignedAt || null,
-    assignedBy: idStr(doc.assignedBy),
-    annotatedBy: idStr(doc.annotatedBy),
-    annotatedAt: doc.annotatedAt || null,
-    annotationNote: doc.annotationNote ?? null,
-    version: doc.version,
-    createdBy: idStr(doc.createdBy),
-    updatedBy: idStr(doc.updatedBy),
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  };
-}
-
-function dtoToDoc(dto) {
-  const doc = { ...dto };
-  delete doc.id;
-  delete doc._oldId; // --- fix: don't persist internal bookkeeping ---
-  if ("datasetId" in doc) doc.datasetId = toOid(doc.datasetId);
-  if ("assignedTo" in doc)
-    doc.assignedTo = doc.assignedTo ? toOid(doc.assignedTo) : null;
-  if ("assignedBy" in doc)
-    doc.assignedBy = doc.assignedBy ? toOid(doc.assignedBy) : null;
-  if ("annotatedBy" in doc)
-    doc.annotatedBy = doc.annotatedBy ? toOid(doc.annotatedBy) : null;
-  if ("createdBy" in doc)
-    doc.createdBy = doc.createdBy ? toOid(doc.createdBy) : null;
-  if ("updatedBy" in doc)
-    doc.updatedBy = doc.updatedBy ? toOid(doc.updatedBy) : null;
-  return doc;
-}
-
-function patchToSet(patch) {
-  const set = { ...patch };
-  delete set.id;
-  delete set._id;
-  for (const k of ["assignedTo", "assignedBy", "annotatedBy", "updatedBy"]) {
-    if (k in set) set[k] = set[k] ? toOid(set[k]) : null;
-  }
-  return set;
-}
 
 function translateError(err) {
   if (err && err.code === 11000) {
@@ -136,32 +28,28 @@ function translateError(err) {
   return err;
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
 class Comment {
   static collection() {
-    return getDB().collection(COLLECTION);
+    return storage.getStore().collection(COLLECTION);
   }
 
   static async findById(id) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return null;
     const doc = await this.collection().findOne({ _id: oid });
-    return toDTO(doc);
+    return commentToDTO(doc);
   }
 
   static async findOne(domainFilter) {
-    const doc = await this.collection().findOne(toMongoFilter(domainFilter));
-    return toDTO(doc);
+    const doc = await this.collection().findOne(
+      commentFilter(domainFilter, objectIds),
+    );
+    return commentToDTO(doc);
   }
 
   static async findMany(domainFilter, options = {}) {
-    const mongoFilter = toMongoFilter(domainFilter);
+    const mongoFilter = commentFilter(domainFilter, objectIds);
     const page = Math.max(1, options.page || 1);
-    // --- fix: HTTP-facing callers stay capped at 200; internal callers
-    // (duplication, delete, ML export) can opt into a higher cap. ---
     const hardMax = options.internal === true ? 1_000_000 : 200;
     const limit = Math.min(hardMax, Math.max(1, options.limit || 50));
     const skip = (page - 1) * limit;
@@ -179,7 +67,7 @@ class Comment {
     ]);
 
     return {
-      comments: docs.map(toDTO),
+      comments: docs.map(commentToDTO),
       total,
       page,
       limit,
@@ -188,11 +76,11 @@ class Comment {
   }
 
   static async count(domainFilter) {
-    return this.collection().countDocuments(toMongoFilter(domainFilter));
+    return this.collection().countDocuments(commentFilter(domainFilter, objectIds));
   }
 
   static async countByStatus(datasetId) {
-    const oid = toOid(datasetId);
+    const oid = objectIds.coerce(datasetId);
     if (!oid) return { total: 0, pending: 0, annotated: 0 };
 
     const [total, pending, annotated] = await Promise.all([
@@ -205,10 +93,9 @@ class Comment {
   }
 
   static async groupByField(datasetId, field) {
-    // --- fix: null datasetId means "all datasets" (used by global analytics) ---
     const match = {};
     if (datasetId) {
-      const oid = toOid(datasetId);
+      const oid = objectIds.coerce(datasetId);
       if (!oid) return [];
       match.datasetId = oid;
     }
@@ -227,7 +114,7 @@ class Comment {
   }
 
   static async lengthHistogram(datasetId, boundaries) {
-    const oid = toOid(datasetId);
+    const oid = objectIds.coerce(datasetId);
     if (!oid) return [];
 
     const rows = await this.collection()
@@ -264,7 +151,7 @@ class Comment {
   }
 
   static async findTextsForDuplicates(datasetId, limit = 2000) {
-    const oid = toOid(datasetId);
+    const oid = objectIds.coerce(datasetId);
     if (!oid) return [];
     const docs = await this.collection()
       .find({ datasetId: oid }, { projection: { commentText: 1 } })
@@ -275,26 +162,26 @@ class Comment {
 
   static async findForExport(domainFilter) {
     const docs = await this.collection()
-      .find(toMongoFilter(domainFilter))
+      .find(commentFilter(domainFilter, objectIds))
       .sort({ createdAt: 1 })
       .toArray();
-    return docs.map(toDTO);
+    return docs.map(commentToDTO);
   }
 
   static async findManyByIds(ids) {
-    const objectIds = (ids || []).map(toOid).filter(Boolean);
-    if (!objectIds.length) return [];
+    const objectIdsIn = (ids || []).map((v) => objectIds.coerce(v)).filter(Boolean);
+    if (!objectIdsIn.length) return [];
     const docs = await this.collection()
-      .find({ _id: { $in: objectIds } })
+      .find({ _id: { $in: objectIdsIn } })
       .toArray();
-    return docs.map(toDTO);
+    return docs.map(commentToDTO);
   }
 
   static async create(dto) {
     if (!dto.datasetId || !dto.sourceId) {
       throw new ValidationError("datasetId and sourceId are required");
     }
-    const doc = dtoToDoc(dto);
+    const doc = dtoToDocument(dto, objectIds, COMMENT_DOC_REF_FIELDS);
     try {
       const r = await this.collection().insertOne(doc);
       return { id: r.insertedId.toString() };
@@ -304,28 +191,38 @@ class Comment {
   }
 
   static async updateById(id, patch) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { matchedCount: 0, modifiedCount: 0 };
-    const set = { ...patchToSet(patch), updatedAt: new Date() };
+    const set = {
+      ...sanitizePatch(patch, objectIds, COMMENT_REF_FIELDS),
+      updatedAt: new Date(),
+    };
     const r = await this.collection().updateOne({ _id: oid }, { $set: set });
     return { matchedCount: r.matchedCount, modifiedCount: r.modifiedCount };
   }
 
   static async updateMany(domainFilter, patch) {
-    const set = { ...patchToSet(patch), updatedAt: new Date() };
-    const r = await this.collection().updateMany(toMongoFilter(domainFilter), {
-      $set: set,
-    });
+    const set = {
+      ...sanitizePatch(patch, objectIds, COMMENT_REF_FIELDS),
+      updatedAt: new Date(),
+    };
+    const r = await this.collection().updateMany(
+      commentFilter(domainFilter, objectIds),
+      { $set: set },
+    );
     return { modifiedCount: r.modifiedCount };
   }
 
   static async bulkUpdate(patches) {
     if (!patches || !patches.length) return { modifiedCount: 0 };
     const ops = patches.map(({ id, patch }) => {
-      const set = { ...patchToSet(patch), updatedAt: new Date() };
+      const set = {
+        ...sanitizePatch(patch, objectIds, COMMENT_REF_FIELDS),
+        updatedAt: new Date(),
+      };
       return {
         updateOne: {
-          filter: { _id: toOid(id) },
+          filter: { _id: objectIds.coerce(id) },
           update: { $set: set },
         },
       };
@@ -334,15 +231,10 @@ class Comment {
     return { modifiedCount: r.modifiedCount };
   }
 
-  /**
-   * Bulk-insert comments.
-   * Returns [{ id, index }] for successfully inserted rows.
-   * The `index` refers to the position in the input array.
-   */
   static async insertMany(dtos) {
     if (!dtos || !dtos.length) return [];
 
-    const docs = dtos.map((dto) => dtoToDoc(dto));
+    const docs = dtos.map((dto) => dtoToDocument(dto, objectIds, COMMENT_DOC_REF_FIELDS));
     const indices = dtos.map((_, i) => i);
 
     let insertedIds;
@@ -350,7 +242,6 @@ class Comment {
       const result = await this.collection().insertMany(docs, { ordered: false });
       insertedIds = result.insertedIds || {};
     } catch (err) {
-      // --- fix: grab insertedIds from every shape the driver has used ---
       insertedIds =
         (err && err.result && err.result.insertedIds) ||
         (err && err.insertedIds) ||
@@ -368,14 +259,16 @@ class Comment {
   }
 
   static async deleteById(id) {
-    const oid = toOid(id);
+    const oid = objectIds.coerce(id);
     if (!oid) return { deletedCount: 0 };
     const r = await this.collection().deleteOne({ _id: oid });
     return { deletedCount: r.deletedCount };
   }
 
   static async deleteMany(domainFilter) {
-    const r = await this.collection().deleteMany(toMongoFilter(domainFilter));
+    const r = await this.collection().deleteMany(
+      commentFilter(domainFilter, objectIds),
+    );
     return { deletedCount: r.deletedCount };
   }
 
