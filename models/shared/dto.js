@@ -3,6 +3,8 @@
 //
 // A DTO is the only shape the rest of the application ever sees:
 //   * `id` is a string, never a driver id
+//   * `_id` mirrors `id` — the client reads `_id` everywhere, so every
+//     entity must carry it. Doing it here means no service can forget.
 //   * every reference is a string or null
 //   * optional fields get a stable default (`?? null`, `|| []`, `|| 0`)
 //
@@ -15,9 +17,22 @@
 
 const { idStr } = require("./ids");
 
+/**
+ * Attach the `_id` alias to a DTO.
+ *
+ * The client reads `_id` on every entity (React keys, links, lookups), so the
+ * alias belongs to the shape itself rather than to whichever service happens
+ * to return the object. Doing it here keeps the two fields from drifting
+ * apart and stops a new endpoint from silently shipping one without it.
+ */
+function withIdAlias(dto) {
+  if (!dto) return null;
+  return { ...dto, _id: dto.id };
+}
+
 function commentToDTO(doc) {
   if (!doc) return null;
-  return {
+  return withIdAlias({
     id: idStr(doc._id),
     datasetId: idStr(doc.datasetId),
     sourceId: doc.sourceId,
@@ -36,7 +51,7 @@ function commentToDTO(doc) {
     updatedBy: idStr(doc.updatedBy),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
-  };
+  });
 }
 
 function userToDTO(doc, { includePassword = false } = {}) {
@@ -52,12 +67,12 @@ function userToDTO(doc, { includePassword = false } = {}) {
     updatedAt: doc.updatedAt,
   };
   if (includePassword) dto.password = doc.password;
-  return dto;
+  return withIdAlias(dto);
 }
 
 function datasetToDTO(doc) {
   if (!doc) return null;
-  return {
+  return withIdAlias({
     id: idStr(doc._id),
     name: doc.name,
     originalFileName: doc.originalFileName,
@@ -82,12 +97,12 @@ function datasetToDTO(doc) {
     duplicatedFrom: idStr(doc.duplicatedFrom),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
-  };
+  });
 }
 
 function taxonomyToDTO(doc) {
   if (!doc) return null;
-  return {
+  return withIdAlias({
     id: idStr(doc._id),
     name: doc.name,
     description: doc.description ?? "",
@@ -98,12 +113,12 @@ function taxonomyToDTO(doc) {
     updatedBy: idStr(doc.updatedBy),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
-  };
+  });
 }
 
 function commentVersionToDTO(doc) {
   if (!doc) return null;
-  return {
+  return withIdAlias({
     id: idStr(doc._id),
     commentId: idStr(doc.commentId),
     version: doc.version,
@@ -113,12 +128,12 @@ function commentVersionToDTO(doc) {
     restoredFrom: doc.restoredFrom ?? null,
     changedBy: idStr(doc.changedBy),
     createdAt: doc.createdAt,
-  };
+  });
 }
 
 function auditLogToDTO(doc) {
   if (!doc) return null;
-  return {
+  return withIdAlias({
     id: idStr(doc._id),
     action: doc.action,
     actorId: idStr(doc.actorId),
@@ -128,7 +143,7 @@ function auditLogToDTO(doc) {
     targetId: idStr(doc.targetId),
     metadata: doc.metadata || {},
     at: doc.at,
-  };
+  });
 }
 
 module.exports = {

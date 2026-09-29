@@ -293,7 +293,7 @@ async function getDatasetAnalytics(datasetId, user) {
 
   return {
     dataset: {
-      _id: dataset.id,
+      _id: dataset._id,
       name: dataset.name,
       status: dataset.status,
       taxonomyId: dataset.taxonomyId || null,

@@ -88,6 +88,9 @@ async function runScenario(models) {
       ? {
           ...user,
           id: alias(user.id),
+          // `_id` mirrors `id` on every DTO; alias it too, or the raw
+          // provider-generated id would make every comparison differ.
+          _id: alias(user.id),
           createdAt: "<date>",
           updatedAt: "<date>",
         }
@@ -149,6 +152,7 @@ async function runScenario(models) {
   out.taxonomy = {
     ...(await Taxonomy.findById(taxonomy.id)),
     id: alias(taxonomy.id),
+    _id: alias(taxonomy.id),
     createdBy: alias((await Taxonomy.findById(taxonomy.id)).createdBy),
     createdAt: "<date>",
     updatedAt: "<date>",

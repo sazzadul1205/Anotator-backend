@@ -131,8 +131,11 @@ async function login({ email, password, ip }) {
   });
 
   return {
+    // Explicit public whitelist: the client must not see tokenVersion.
+    // `_id` is already on the DTO; `id` is dropped so the login response
+    // matches the shape every other endpoint returns.
     user: {
-      _id: user.id,
+      _id: user._id,
       email: user.email,
       name: user.name,
       role: user.role,

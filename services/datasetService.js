@@ -63,16 +63,15 @@ async function listDatasets(query, user) {
 
   const includeCounts = query.includeCounts === "true";
 
-  // --- fix: always expose `_id` alias so the frontend sees a consistent shape ---
+  // The `_id` alias every client reads comes from datasetToDTO; the service
+  // only adds what is genuinely a service-level concern.
   if (!includeCounts) {
-    const datasets = await Dataset.findMany(filter);
-    return datasets.map((d) => ({ ...d, _id: d.id }));
+    return Dataset.findMany(filter);
   }
 
   const datasets = await Dataset.findManyWithCounts(filter);
   return datasets.map((d) => ({
     ...d,
-    _id: d.id,
     summary: {
       total: d.summary.total,
       annotated: d.summary.annotated,

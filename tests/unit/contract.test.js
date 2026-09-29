@@ -37,6 +37,9 @@ const {
   commentToDTO,
   userToDTO,
   datasetToDTO,
+  taxonomyToDTO,
+  commentVersionToDTO,
+  auditLogToDTO,
 } = require(path.join(ROOT, "models", "shared", "dto"));
 const { dateKey, bucketByBoundaries } = require(
   path.join(ROOT, "models", "shared", "aggregate"),
@@ -274,6 +277,26 @@ dtoSuite.test("a null document maps to null", () => {
   expect.equal(commentToDTO(null), null);
   expect.equal(userToDTO(null), null);
   expect.equal(datasetToDTO(null), null);
+});
+
+dtoSuite.test("every DTO carries the _id alias the client reads", () => {
+  // The React client keys and links on `_id` everywhere. If a DTO ever
+  // ships without it, every list in the UI silently loses its keys.
+  const doc = { _id: "507f1f77bcf86cd799439011" };
+  for (const [name, dto] of [
+    ["comment", commentToDTO(doc)],
+    ["user", userToDTO(doc)],
+    ["dataset", datasetToDTO(doc)],
+    ["taxonomy", taxonomyToDTO(doc)],
+    ["commentVersion", commentVersionToDTO(doc)],
+    ["auditLog", auditLogToDTO(doc)],
+  ]) {
+    expect.equal(dto._id, dto.id, `${name} DTO is missing the _id alias`);
+  }
+});
+
+dtoSuite.test("the _id alias is null-safe, not the string 'null'", () => {
+  expect.equal(userToDTO({ _id: null })._id, null);
 });
 
 // ===========================================================================
