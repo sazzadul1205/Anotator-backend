@@ -20,6 +20,11 @@ const MYSQL_TYPE = {
   str: "VARCHAR(255)",
   long: "LONGTEXT",
   int: "BIGINT",
+  // A genuine fixed-point float. Bounding boxes are stored normalised to 0..1
+  // with six decimals, so an integer column would truncate every coordinate to
+  // 0 or 1 and silently destroy the geometry. DECIMAL (not DOUBLE) so the value
+  // round-trips exactly and compares identically on every provider.
+  float: "DECIMAL(12,6)",
   bool: "TINYINT(1)",
   date: "VARCHAR(32)",
   json: "LONGTEXT",
@@ -31,6 +36,10 @@ const SQLITE_TYPE = {
   str: "TEXT",
   long: "TEXT",
   int: "INTEGER",
+  // SQLite's REAL is an IEEE double. Values are rounded to six decimals on the
+  // way in (utils/geometry.js), so the stored double is exact enough to
+  // round-trip identically across providers.
+  float: "REAL",
   bool: "INTEGER",
   // ISO-8601 UTC strings sort and compare correctly as text.
   date: "TEXT",

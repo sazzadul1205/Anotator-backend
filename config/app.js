@@ -159,6 +159,45 @@ const config = {
     global: int("RATE_LIMIT_GLOBAL", 0) || null, // 0 => derive from env
     auth: int("RATE_LIMIT_AUTH", 0) || null,
   },
+
+  // --- Media (image / video assets) -----------------------------------------
+  // The *bytes* of an uploaded image or video are not stored in the database.
+  // The database holds metadata and annotation geometry; the file itself lives
+  // on the local filesystem under `media.root`, and is served only through an
+  // authenticated route (never express.static) so access control is not
+  // bypassed by knowing a path.
+  //
+  // Local disk is deliberate and temporary. The storage seam here is the same
+  // one `config/storage/` provides for records: swapping this file for an S3
+  // or GCS adapter later should not touch a single service.
+  media: {
+    root: path.resolve(rootDir, str("MEDIA_ROOT", "storage/media")),
+    // Uploads are buffered in memory by multer before being written here, so
+    // this cap is a memory cap, not just a disk cap. It is deliberately
+    // generous for video; see MEDIA_UPLOAD_NOTE below.
+    maxUploadBytes:
+      int("MEDIA_MAX_UPLOAD_MB", 100, { min: 1, max: 2048 }) * 1024 * 1024,
+    maxFilesPerRequest: int("MEDIA_MAX_FILES", 50, { min: 1, max: 500 }),
+    // Reject uploads whose pixel dimensions exceed this. A decompression-bomb
+    // guard: a small file can declare enormous dimensions.
+    maxPixels:
+      int("MEDIA_MAX_PIXELS", 50_000_000, { min: 1_000, max: 500_000_000 }),
+    // Extension allow-list, lower-case and dot-less. This is the authority for
+    // "is this an accepted media type" — the browser-supplied MIME type is not
+    // trusted, because it is attacker-controlled.
+    imageExtensions: list("MEDIA_IMAGE_EXTENSIONS", [
+      "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
+    ]),
+    videoExtensions: list("MEDIA_VIDEO_EXTENSIONS", [
+      "mp4", "m4v", "mov", "webm", "mkv", "avi",
+    ]),
+    // Hard ceiling on how many assets one dataset may hold. Guards the disk
+    // against an accidental upload loop; 0 disables the limit.
+    maxAssetsPerDataset: int("MEDIA_MAX_ASSETS_PER_DATASET", 0, {
+      min: 0,
+      max: 10_000_000,
+    }),
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -204,6 +243,18 @@ function collectProblems(cfg = config) {
     problems.push(
       `DATA_PROVIDER "${cfg.storage.provider}" is not registered (known: ${STORAGE_PROVIDERS.join(", ")})`,
     );
+  }
+
+  // Media is optional, so a broken media config must not stop the app from
+  // serving the text-annotation domain. It is reported, not thrown.
+  if (cfg.media && !cfg.media.root) {
+    problems.push("MEDIA_ROOT is required for image/video annotation");
+  }
+  if (cfg.media && cfg.media.maxUploadBytes < 1024 * 1024) {
+    problems.push("MEDIA_MAX_UPLOAD_MB must be at least 1");
+  }
+  if (cfg.media && cfg.media.imageExtensions.length === 0) {
+    problems.push("MEDIA_IMAGE_EXTENSIONS must list at least one extension");
   }
 
   return problems;

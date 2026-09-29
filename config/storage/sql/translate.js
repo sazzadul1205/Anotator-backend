@@ -58,6 +58,15 @@ function encodeValue(kind, value) {
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
     }
+    // Bounding-box coordinates. MySQL DECIMAL arrives as a string over the
+    // wire and SQLite REAL as a number, so both are funnelled through
+    // Number(). A non-finite value becomes null rather than NaN, because NaN
+    // compares false against everything in SQL and would make a row silently
+    // unfindable.
+    case "float": {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
     case "json":
       return JSON.stringify(value);
     default:
@@ -77,6 +86,13 @@ function decodeValue(kind, value) {
       return Boolean(Number(value));
     case "int":
       return Number(value);
+    // DECIMAL(12,6) comes back as a string from mysql2; REAL as a number from
+    // node:sqlite. Normalising here is what makes a box read back as the same
+    // JavaScript number on every provider.
+    case "float": {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    }
     case "json":
       try {
         return JSON.parse(value);

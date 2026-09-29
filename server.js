@@ -9,6 +9,7 @@ require("dotenv").config();
 const { config, assertValid } = require("./config/app");
 const { validateEnv } = require("./config/env");
 const storage = require("./config/storage");
+const media = require("./config/media");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const concurrency = require("./config/concurrency");
 const { Dataset } = require("./models");
@@ -66,12 +67,17 @@ app.get("/", (req, res) => {
 app.get("/health", async (req, res) => {
   const dbStatus = (await storage.ping()) ? "ok" : "error";
   const healthy = dbStatus === "ok";
+  // Media is reported but does NOT affect the status code. It is an optional
+  // capability, and taking the whole API to 503 because a disk is full would
+  // break the text-annotation half of the app over a feature it does not use.
+  const mediaReady = await media.ping();
 
   res.status(healthy ? 200 : 503).json({
     success: healthy,
     message: healthy ? "Server is healthy" : "Database unavailable",
     db: dbStatus,
     storage: storage.status(),
+    media: { ...media.describe(), available: mediaReady },
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     queues: {
@@ -89,6 +95,7 @@ app.use("/api/comments", require("./routes/commentRoute"));
 app.use("/api/taxonomies", require("./routes/taxonomyRoute"));
 app.use("/api/audit", require("./routes/auditRoute"));
 app.use("/api/analytics", require("./routes/analyticsRoute"));
+app.use("/api/media", require("./routes/mediaRoute"));
 
 app.use(notFound);
 app.use(errorHandler);
@@ -99,6 +106,20 @@ let server;
 async function start() {
   // Connects the selected provider and applies its schema/indexes.
   await storage.init();
+
+  // Media bytes live on local disk, which is a separate seam from the record
+  // store. The directory is created here so the first upload does not have to
+  // race mkdir, and so a misconfigured MEDIA_ROOT is reported at boot rather
+  // than on the first upload an user makes.
+  try {
+    const root = await media.init();
+    console.log(`🖼️  Media store ready at ${root}`);
+  } catch (err) {
+    // Not fatal. The text-annotation half of the app does not need media, and
+    // a read-only or full volume should not stop the API from serving.
+    console.warn(`⚠️  Media store unavailable: ${err.message}`);
+    console.warn("   Image/video annotation will fail until this is fixed.");
+  }
 
   // Model-owned cleanup of stale imports from a prior crash.
   const cutoff = new Date(Date.now() - 30 * 60 * 1000);
@@ -130,6 +151,10 @@ function shutdown(signal) {
 
   const done = () => {
     console.log("HTTP server closed.");
+    // The media store holds no connections to close — files are opened and
+    // closed per request — so there is nothing to flush here. It is called out
+    // because the JSON record store *does* need flushing, and the order matters
+    // less than the fact that both are inside the same shutdown path.
     storage.close().finally(() => process.exit(0));
   };
 

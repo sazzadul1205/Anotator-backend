@@ -68,7 +68,20 @@ function getModels() {
 // Exported as lazy getters so `require("../models")` is cheap and so the
 // strategy is only resolved when a model is actually touched.
 
-for (const name of ["Comment", "CommentVersion", "Dataset", "User", "Taxonomy", "AuditLog", "SystemLock"]) {
+for (const name of [
+  "Comment",
+  "CommentVersion",
+  "Dataset",
+  "User",
+  "Taxonomy",
+  "AuditLog",
+  "SystemLock",
+  "MediaDataset",
+  "MediaAsset",
+  "MediaAnnotation",
+  "MediaAnnotationVersion",
+  "MediaLabelSet",
+]) {
   Object.defineProperty(module.exports, name, {
     enumerable: true,
     configurable: true,

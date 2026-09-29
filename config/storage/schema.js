@@ -18,6 +18,8 @@
 //   str   short indexable text (VARCHAR); default for enums, emails, names
 //   long  long free text (comment bodies, descriptions) — never indexed
 //   int   whole number
+//   float a fixed-point decimal (normalised bounding-box coordinates) — use
+//         this, not `int`, for any value that can fall between 0 and 1
 //   bool  stored as 0/1
 //   date  stored as an ISO-8601 UTC string, which sorts and compares
 //         correctly as text and round-trips to a JavaScript Date
@@ -179,6 +181,189 @@ const COLLECTIONS = {
       updatedAt: "date",
     },
     indexes: [{ keys: ["isActive"] }, { keys: ["name"] }],
+  },
+
+  // -------------------------------------------------------------------------
+  // Media: images and videos
+  // -------------------------------------------------------------------------
+  // A parallel domain to `datasets`/`comments`, not an extension of them. The
+  // unit of work is an *asset* (one image or one video) carrying zero or more
+  // *annotations* (a whole-image label or a bounding box). The text domain's
+  // `sentiment` + `type` pair has no meaning here, so the two are kept apart
+  // rather than overloading `comments` with geometry.
+  //
+  // Only metadata lives in these collections. The file bytes are on disk under
+  // `config.media.root`; see config/media.js.
+
+  media_label_sets: {
+    // The detection label vocabulary for a dataset — the equivalent of a
+    // taxonomy, but a flat list of class names rather than two label axes.
+    // `labels` is a JSON array of { value, label, color } entries, because
+    // COCO/YOLO exports need a stable class index and annotators need a
+    // swatch, neither of which the label text alone provides.
+    columns: {
+      id: "id",
+      name: "str",
+      description: "long",
+      labels: "json",
+      isActive: "bool",
+      createdBy: "ref",
+      updatedBy: "ref",
+      createdAt: "date",
+      updatedAt: "date",
+    },
+    indexes: [{ keys: ["isActive"] }, { keys: ["name"] }],
+  },
+
+  media_datasets: {
+    columns: {
+      id: "id",
+      name: "str",
+      description: "long",
+      // "image" | "video" | "mixed" — mixed means the dataset holds both,
+      // which is allowed but blocks per-dataset format assumptions.
+      mediaKind: "str",
+      labelSetId: "ref",
+      labelSetName: "str",
+      labelSetAssignedAt: "date",
+      // Denormalised counters, kept in step by the asset service so the list
+      // view is one query rather than an aggregate per row.
+      totalAssets: "int",
+      annotatedAssets: "int",
+      totalAnnotations: "int",
+      // `int`, not `long`: `long` is a TEXT type, so a byte count declared as
+      // `long` would round-trip as the string "12345" and break every
+      // arithmetic comparison on it.
+      totalBytes: "int",
+      status: "str",
+      createdBy: "ref",
+      createdAt: "date",
+      updatedAt: "date",
+    },
+    indexes: [
+      { keys: ["createdAt"], direction: -1 },
+      { keys: ["labelSetId"] },
+      { keys: ["status"] },
+    ],
+  },
+
+  media_assets: {
+    columns: {
+      id: "id",
+      datasetId: "ref",
+      // "image" | "video"
+      kind: "str",
+      // The client-supplied name, recorded for display only. It never
+      // influences where the file is written — see config/media.js.
+      originalFileName: "str",
+      extension: "str",
+      mimeType: "str",
+      // `int`, not `long` — see media_datasets.totalBytes.
+      sizeBytes: "int",
+      // Content hash of the file bytes. Gives a cheap exact-duplicate check on
+      // upload, which is the single most common data-quality problem when
+      // assembling a training set from a scrape.
+      checksum: "str",
+      width: "int",
+      height: "int",
+      // Video only. Null when the container is not parseable (WebM, MKV).
+      durationMs: "int",
+      // Path relative to the media root. Derived from generated ids only.
+      storagePath: "str",
+      // "pending" (no annotations) | "annotated" (at least one) — derived, and
+      // the same shape the text domain uses so analytics code reads alike.
+      status: "str",
+      annotationCount: "int",
+      assignedTo: "ref",
+      assignedAt: "date",
+      assignedBy: "ref",
+      // Provenance: "upload" today. Reserved so a future COCO-import can
+      // coexist with hand-drawn data without a migration.
+      source: "str",
+      createdBy: "ref",
+      updatedBy: "ref",
+      createdAt: "date",
+      updatedAt: "date",
+    },
+    indexes: [
+      // One copy of a given file per dataset, so re-uploading a scrape cannot
+      // silently duplicate a training example.
+      { keys: ["datasetId", "checksum"], unique: true },
+      { keys: ["datasetId", "createdAt"], direction: -1 },
+      { keys: ["datasetId", "status"] },
+      { keys: ["assignedTo"] },
+      { keys: ["kind"] },
+    ],
+  },
+
+  media_annotations: {
+    columns: {
+      id: "id",
+      assetId: "ref",
+      // Denormalised from the asset so "every annotation in this dataset" is a
+      // single indexed query. The cascade delete and the exporters both need
+      // that shape, and the SQL layer can only filter on declared fields.
+      datasetId: "ref",
+      // "bbox" (a region) | "classification" (a whole-image label)
+      kind: "str",
+      // The label *value* from the dataset's label set. A slug, not a display
+      // name, because that is what both COCO (`category_name`) and YOLO (the
+      // class index row) ultimately key on.
+      label: "str",
+      // Normalised 0..1, top-left origin. Null for `classification`.
+      x: "float",
+      y: "float",
+      boxWidth: "float",
+      boxHeight: "float",
+      // Video only. Both null for images.
+      frameIndex: "int",
+      timestampMs: "int",
+      // The parent asset's pixel dimensions, copied at write time. This is
+      // denormalisation on purpose: the annotator UI lists every annotation of
+      // an asset at once and needs to convert to pixels for each one, and a
+      // join per row to recover two numbers that never change is pure waste.
+      // They are also the audit trail: if an asset's dimensions are ever
+      // corrected, old annotations keep the geometry they were drawn against.
+      width: "int",
+      height: "int",
+      note: "long",
+      // Monotonic per asset, so a client's optimistic-concurrency check can
+      // reject an edit based on a stale view.
+      revision: "int",
+      createdBy: "ref",
+      updatedBy: "ref",
+      createdAt: "date",
+      updatedAt: "date",
+    },
+    indexes: [
+      { keys: ["assetId", "createdAt"] },
+      { keys: ["datasetId", "label"] },
+      { keys: ["datasetId", "kind"] },
+      { keys: ["createdAt"], direction: -1 },
+    ],
+  },
+
+  media_annotation_versions: {
+    // Mirrors comment_versions: every create/update/delete of an annotation
+    // appends an immutable snapshot, so annotation history is as auditable as
+    // text history. Restoring appends a new revision rather than rewriting.
+    columns: {
+      id: "id",
+      annotationId: "ref",
+      assetId: "ref",
+      datasetId: "ref",
+      revision: "int",
+      snapshot: "json",
+      changedFields: "json",
+      changeType: "str",
+      restoredFrom: "int",
+      changedBy: "ref",
+      createdAt: "date",
+    },
+    indexes: [
+      { keys: ["annotationId", "revision"], direction: -1 },
+      { keys: ["assetId", "createdAt"], direction: -1 },
+    ],
   },
 };
 

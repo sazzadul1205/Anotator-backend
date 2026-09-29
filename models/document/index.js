@@ -1,5 +1,5 @@
 // models/document/index.js
-// The document strategy: seven model classes that talk to a store presenting
+// The document strategy: twelve model classes that talk to a store presenting
 // the MongoDB collection API over string ids.
 //
 // Three providers select this strategy — json, sqlite and mysql — because all
@@ -19,4 +19,10 @@ module.exports = {
   Taxonomy: require("./Taxonomy"),
   AuditLog: require("./AuditLog"),
   SystemLock: require("./SystemLock"),
+  // Media: images and videos
+  MediaDataset: require("./MediaDataset"),
+  MediaAsset: require("./MediaAsset"),
+  MediaAnnotation: require("./MediaAnnotation"),
+  MediaAnnotationVersion: require("./MediaAnnotationVersion"),
+  MediaLabelSet: require("./MediaLabelSet"),
 };
