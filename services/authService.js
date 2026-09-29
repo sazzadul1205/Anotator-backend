@@ -3,6 +3,7 @@
 
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { config } = require("../config/app");
 const { User, SystemLock } = require("../models");
 const { audit } = require("../utils/audit");
 
@@ -119,7 +120,7 @@ async function login({ email, password, ip }) {
       role: user.role,
       tokenVersion: user.tokenVersion || 0,
     },
-    process.env.JWT_SECRET,
+    config.jwtSecret,
     { expiresIn: "7d" },
   );
 

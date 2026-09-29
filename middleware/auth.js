@@ -3,6 +3,7 @@
 // Uses the User model so this stays storage-agnostic.
 
 const jwt = require("jsonwebtoken");
+const { config } = require("../config/app");
 const { User } = require("../models");
 
 async function verifyToken(req, res, next) {
@@ -23,7 +24,7 @@ async function verifyToken(req, res, next) {
 
     let payload;
     try {
-      payload = jwt.verify(token, process.env.JWT_SECRET);
+      payload = jwt.verify(token, config.jwtSecret);
     } catch {
       return res
         .status(401)

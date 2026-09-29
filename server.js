@@ -6,9 +6,9 @@ const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
-const { connectDB, getDB } = require("./config/db");
-const { ensureIndexes } = require("./config/indexes");
+const { config, assertValid } = require("./config/app");
 const { validateEnv } = require("./config/env");
+const storage = require("./config/storage");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const concurrency = require("./config/concurrency");
 const { Dataset } = require("./models");
@@ -17,32 +17,26 @@ validateEnv();
 
 const app = express();
 
-if (process.env.NODE_ENV === "production") {
+if (config.isProduction) {
   app.set("trust proxy", 1);
 }
 
 app.use(helmet());
 
 const corsOptions = {
-  origin:
-    process.env.NODE_ENV === "production"
-      ? (process.env.CORS_ORIGIN || "").split(",").filter(Boolean)
-      : true,
+  // Development reflects the request origin; production uses CORS_ORIGIN.
+  origin: config.isProduction ? config.corsOrigin : true,
   credentials: true,
 };
 app.use(cors(corsOptions));
 
 app.use(express.json());
 
-if (process.env.NODE_ENV === "production") {
-  app.use(morgan("combined"));
-} else {
-  app.use(morgan("dev"));
-}
+app.use(morgan(config.isProduction ? "combined" : "dev"));
 
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: process.env.NODE_ENV === "production" ? 300 : 10000,
+  max: config.rateLimit.global || (config.isProduction ? 300 : 10000),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: "Too many requests. Please slow down." },
@@ -50,10 +44,10 @@ const globalLimiter = rateLimit({
 
 app.use("/api", globalLimiter);
 
-// DB readiness guard
+// Storage readiness guard. Provider-neutral: `storage.getStore()` returns the
+// Mongo Db handle or the JSON store, and is null until connected.
 app.use("/api", (req, res, next) => {
-  const db = getDB();
-  if (!db) {
+  if (!storage.getStore()) {
     return res.status(503).json({
       success: false,
       error: "Database not ready. Try again shortly.",
@@ -63,25 +57,21 @@ app.use("/api", (req, res, next) => {
 });
 
 app.get("/", (req, res) => {
-  res.json({ message: "Annotator backend is running" });
+  res.json({
+    message: "Annotator backend is running",
+    storage: storage.providerName(),
+  });
 });
 
 app.get("/health", async (req, res) => {
-  let dbStatus;
-  try {
-    const db = getDB();
-    await db.command({ ping: 1 });
-    dbStatus = "ok";
-  } catch (err) {
-    console.error(err);
-    dbStatus = "error";
-  }
-
+  const dbStatus = (await storage.ping()) ? "ok" : "error";
   const healthy = dbStatus === "ok";
+
   res.status(healthy ? 200 : 503).json({
     success: healthy,
     message: healthy ? "Server is healthy" : "Database unavailable",
     db: dbStatus,
+    storage: storage.status(),
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     queues: {
@@ -103,14 +93,12 @@ app.use("/api/analytics", require("./routes/analyticsRoute"));
 app.use(notFound);
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
+const PORT = config.port;
 let server;
 
 async function start() {
-  await connectDB();
-  const db = getDB();
-
-  await ensureIndexes(db);
+  // Connects the selected provider and applies its schema/indexes.
+  await storage.init();
 
   // Model-owned cleanup of stale imports from a prior crash.
   const cutoff = new Date(Date.now() - 30 * 60 * 1000);
@@ -121,9 +109,8 @@ async function start() {
 
   server = app.listen(PORT, () => {
     console.log(
-      `🚀 Server running on http://localhost:${PORT}  [NODE_ENV=${
-        process.env.NODE_ENV || "development"
-      }]`,
+      `🚀 Server running on http://localhost:${PORT}  ` +
+        `[NODE_ENV=${config.env}] [storage=${storage.providerName()}]`,
     );
   });
 }
@@ -135,16 +122,22 @@ start().catch((err) => {
 
 function shutdown(signal) {
   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
-  if (!server) process.exit(0);
-  server.close(() => {
-    console.log("HTTP server closed.");
-    process.exit(0);
-  });
-  setTimeout(() => {
+  const force = setTimeout(() => {
     console.error("Forced shutdown after 10s.");
     process.exit(1);
   }, 10000);
+  force.unref();
+
+  const done = () => {
+    console.log("HTTP server closed.");
+    storage.close().finally(() => process.exit(0));
+  };
+
+  if (!server) return done();
+  server.close(done);
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+module.exports = { app, start, assertValid };

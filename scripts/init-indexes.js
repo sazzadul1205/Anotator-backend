@@ -1,69 +1,34 @@
 // scripts/init-indexes.js
-// Run once: node scripts/init-indexes.js
-// Safe to re-run — creates indexes only if they don't exist.
+// Run once: npm run init-indexes
+// Safe to re-run — creating an existing index is a no-op.
+//
+// Provider-aware: it applies whatever schema the currently configured
+// DATA_PROVIDER declares (config/storage/schema.js). For MongoDB that means
+// creating the real indexes; for the JSON store it is a no-op, because the
+// unique constraints are enforced in code on every write.
 
 require("dotenv").config();
-const dns = require("dns");
-dns.setServers(["8.8.8.8"]);
 
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { config } = require("../config/app");
+const storage = require("../config/storage");
 
 async function main() {
-  const client = new MongoClient(process.env.MONGO_URI, {
-    serverApi: {
-      version: ServerApiVersion.v1,
-      strict: false,
-      deprecationErrors: true,
-    },
-  });
+  const provider = storage.getProvider();
+  console.log(`Applying schema for provider "${provider.name}"...`);
 
-  try {
-    await client.connect();
-    const db = client.db(process.env.DB_NAME || "annotator_db");
+  await storage.init();
 
-    console.log("Creating indexes...");
-
-    // ---- users ----
-    await db.collection("users").createIndex({ email: 1 }, { unique: true });
-    await db.collection("users").createIndex({ role: 1, isActive: 1 });
-    console.log("  users done");
-
-    // ---- datasets ----
-    await db.collection("datasets").createIndex({ uploadedBy: 1, createdAt: -1 });
-    await db.collection("datasets").createIndex({ status: 1 });
-    console.log("  datasets done");
-
-    // ---- comments ----
-    // Unique: prevents duplicate sourceId within the same dataset (race-safe).
-    await db
-      .collection("comments")
-      .createIndex({ datasetId: 1, sourceId: 1 }, { unique: true });
-
-    // Common filters
-    await db.collection("comments").createIndex({ datasetId: 1, status: 1 });
-    await db.collection("comments").createIndex({ datasetId: 1, sentiment: 1 });
-    await db.collection("comments").createIndex({ datasetId: 1, type: 1 });
-    await db.collection("comments").createIndex({ status: 1, assignedTo: 1 });
-    await db.collection("comments").createIndex({ createdAt: -1 });
-
-    // Text search on commentText
-    await db.collection("comments").createIndex({ commentText: "text" });
-    console.log("  comments done");
-
-    // ---- comment_versions ----
-    await db
-      .collection("comment_versions")
-      .createIndex({ commentId: 1, version: -1 });
-    await db.collection("comment_versions").createIndex({ commentId: 1 });
-    console.log("  comment_versions done");
-
-    console.log("\nAll indexes created successfully.");
-  } catch (err) {
-    console.error("Index creation failed:", err);
-    process.exit(1);
-  } finally {
-    await client.close();
+  console.log(`\nSchema applied successfully.`);
+  if (provider.name === "json") {
+    console.log(
+      `The JSON store has no secondary indexes; data lives in ${config.storage.json.dir}`,
+    );
   }
 }
 
-main();
+main()
+  .then(() => storage.close())
+  .catch((err) => {
+    console.error("Schema application failed:", err.message);
+    process.exit(1);
+  });
