@@ -444,19 +444,36 @@ Annotators label text — usually customer reviews, tickets or survey answers �
 with a **sentiment** and a **type/language**. The output is a labelled dataset
 for training or evaluating a classifier.
 
-The problem that makes it more than a CRUD app is that labelling is
+Annotators can also label **images and video** with **bounding boxes** and
+**whole-image classifications**, for object detection and classification
+training. That is a second, parallel domain — not an extension of the text one:
+
+- Media bytes are **never stored in a record database.** Files live on disk
+  under `MEDIA_ROOT`; the database holds only metadata and annotation geometry.
+  Dropping a dataset drops its directory.
+- Files are served **only** through an authenticated route with Range support.
+  `express.static` is not used, so a media file is not reachable without a token.
+- **Geometry is stored normalised to 0..1**, so a box means the same thing
+  regardless of the image it was drawn on. Pixel values are derived in the DTO.
+- Videos are stored as uploaded and **frame-sampled in the browser**; the server
+  parses only the container header for duration, and never extracts frames.
+
+The text problem that makes this more than a CRUD app is that labelling is
 **iterative and must be trustworthy**:
 
 - Labels are **not universal.** Different datasets use different label sets, so
   a taxonomy is defined per dataset and every annotation is validated against
-  the one bound to its dataset.
+  the one bound to its dataset. The media domain does the same with a
+  **label set** whose slugs become the class names in every export.
 - Annotation is **never final.** Labels get revised, so every change is a new
-  immutable version rather than an overwrite. Restoring an old state appends
-  rather than rewrites, so the history cannot be forged.
+  immutable version rather than an overwrite. Restoring appends rather than
+  rewrites, so the history cannot be forged.
 - **Status is derived, not stored by hand.** A comment is `annotated` only when
   both a sentiment and a type exist; the system derives it so it cannot drift.
+  A media asset is `annotated` once it has at least one annotation.
 - The result has to be **usable for ML**, which means class balance matters.
-  Analytics exist to tell you when your labels are too lopsided to train on.
+  Analytics exist to tell you when your labels are too lopsided to train on, and
+  datasets export to **COCO**, **YOLO** and **CSV**.
 
 ## 2.2 Where everything lives
 
@@ -466,8 +483,9 @@ The problem that makes it more than a CRUD app is that labelling is
 │   ├── app.js         the ONLY module that reads process.env
 │   ├── concurrency.js import/export queues
 │   ├── env.js         turns config problems into readable startup errors
+│   ├── media.js       local media blob store (path-safe file access)
 │   └── storage/       the four providers + shared schema + SQL engine
-├── routes/          URL → guard → controller  (46 API routes)
+├── routes/          URL → guard → controller  (70 API routes)
 ├── controllers/     HTTP in, HTTP out
 ├── middleware/      cross-cutting: auth, error handling, uploads
 ├── services/        the business rules
@@ -475,6 +493,8 @@ The problem that makes it more than a CRUD app is that labelling is
 │   ├── mongo/        MongoDB strategy  (ObjectId, real pipelines)
 │   └── document/     document strategy  (string ids, JS aggregation)
 ├── utils/           small fire-and-forget helpers
+│   ├── geometry.js     bounding-box normalisation and conversion
+│   └── mediaProbe.js   image dimensions and MP4 duration from file headers
 ├── scripts/         operational one-shots
 ├── tests/           the test matrix
 ├── docs/            long-form guides per layer
@@ -731,6 +751,18 @@ Full annotated list in [`.env.example`](.env.example).
 | `RATE_LIMIT_GLOBAL` | `300` prod / `10000` dev | Requests per minute across `/api/**` |
 | `RATE_LIMIT_AUTH` | `5` prod / `1000` dev | Login attempts per 15 minutes |
 
+**Media** (all optional; the image/video domain works with the defaults):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MEDIA_ROOT` | `storage/media` | Where uploaded bytes live. **Not** served statically — only via `GET /api/media/assets/:id/file` |
+| `MEDIA_MAX_UPLOAD_MB` | `100` | Per-file cap. Also a **memory** cap: uploads are buffered before being written |
+| `MEDIA_MAX_FILES` | `50` | Files per upload request |
+| `MEDIA_MAX_PIXELS` | `50000000` | Decompression-bomb guard: rejects files declaring enormous dimensions |
+| `MEDIA_IMAGE_EXTENSIONS` | `jpg,jpeg,png,gif,webp,bmp,tif,tiff` | Accepted image extensions. The **extension** is the authority, not the client-supplied MIME type |
+| `MEDIA_VIDEO_EXTENSIONS` | `mp4,m4v,mov,webm,mkv,avi` | Accepted video extensions |
+| `MEDIA_MAX_ASSETS_PER_DATASET` | `0` | Asset cap per dataset; `0` disables it |
+
 ## 4.2 All commands
 
 | Command | Does | Needs |
@@ -751,7 +783,7 @@ Full annotated list in [`.env.example`](.env.example).
 
 ## 4.3 API surface
 
-46 API routes across 7 files, plus `GET /` and `GET /health`.
+70 API routes across 8 files, plus `GET /` and `GET /health`.
 
 | Group | Routes | File |
 | --- | --- | --- |
@@ -762,6 +794,7 @@ Full annotated list in [`.env.example`](.env.example).
 | Taxonomies | 9 | `routes/taxonomyRoute.js` |
 | Audit | 2 (admin only) | `routes/auditRoute.js` |
 | Analytics | 3 | `routes/analyticsRoute.js` |
+| Media | 24 | `routes/mediaRoute.js` |
 
 Per-endpoint detail (method, path, role, body, response) is in
 [`docs/api.md`](docs/api.md).

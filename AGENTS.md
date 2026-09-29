@@ -24,6 +24,7 @@ route  →  controller  →  service  →  model  →  strategy  →  provider  
 | Services | `services/` | validate, authorise, orchestrate models, write audit entries, run queued jobs | touch `req`/`res`, use `ObjectId` / `$operators` / `storage.getStore()` |
 | Models | `models/` | talk to the provider, map documents ↔ DTOs, translate driver errors | know about HTTP or business flows |
 | Storage | `config/storage/` | connect, ping, apply schema, close | know about models or HTTP |
+| Media store | `config/media.js` | resolve/validate paths, read/write/stream blobs | know about models, datasets or HTTP |
 
 **The rule that matters most:** a new feature should touch the *fewest possible
 layers*. Adding an endpoint touches `routes/` and `controllers/`. A business
@@ -57,12 +58,20 @@ Breaking any of these breaks production, not just tests.
    including MySQL (`ER_DUP_ENTRY`) and SQLite (constraint text).
 6. **Every mutation is versioned.** Creating, importing, updating, annotating and
    restoring a comment each append an immutable snapshot. **Restoring appends a
-   new version; it never rewrites history.**
+   new version; it never rewrites history.** Media annotations follow the same
+   rule, and their version `revision` numbers must stay strictly increasing —
+   reusing one leaves two rows at the same revision and "the latest change"
+   stops being well defined.
 7. **Status is derived, not user-set.** A comment is `annotated` only when both
-   a sentiment and a type exist. Do not let a caller set `status` directly.
+   a sentiment and a type exist. Do not let a caller set `status` directly. A
+   media asset is `annotated` once it has at least one annotation.
 8. **Cascades are multi-step and non-transactional** (dataset → comments →
    versions). There are no transactions on any provider. A partial failure must
    be visible in `services/datasetService.js`, not swallowed.
+9. **Media bytes never go in a record database.** Files live under `MEDIA_ROOT`
+   via `config/media.js`; records hold only metadata and annotation geometry.
+   Media is served only through the authenticated route — never `express.static`.
+   `storagePath` must never appear in a DTO.
 
 ---
 
@@ -128,6 +137,11 @@ These are the four edits you are most likely to make, with the full checklist.
 3. URL + guard in `routes/<name>Route.js`. If admin-only, mount the guard at the
    router so no handler can forget it.
 4. Document it in `docs/api.md`.
+
+If the endpoint takes a file, remember that a multer `fileFilter` has the
+signature `(req, file, done)`, **not** Express's `(req, res, next)`. Passing it
+as separate middleware gives it the response object as `file`, so the
+extension always reads as empty.
 
 ### Adding a config variable
 
@@ -225,7 +239,7 @@ npm run test:unit     # no server, no database, no network — fastest signal
 npm run lint
 ```
 
-Current state: **660 checks passing** across four providers.
+Current state: **1090+ checks passing** across four providers.
 
 | Command | Needs |
 | --- | --- |
@@ -303,6 +317,13 @@ of an unrelated change.
 - **Some single-comment mutations are not audited** (see `docs/models.md` §7).
 - **Sort order is only as stable as the sort key.** No provider guarantees an
   order for ties. If order matters, add a unique tiebreaker to the sort.
+- **`stringIds.coerce` and `objectIds.coerce` must agree** on what counts as a
+  usable id. When they disagreed, a malformed id matched nothing on json /
+  sqlite / mysql and *everything* on mongo. `tests/unit/media.test.js` pins this.
+- **A DTO's JSON key order is part of the response contract**, even though
+  `deepStrictEqual` ignores it. BSON hands projected fields back in its own
+  order, so an aggregate that is returned directly can serialise differently
+  per provider. Map aggregate output into an explicit shape.
 
 ---
 
