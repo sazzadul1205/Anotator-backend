@@ -25,5 +25,8 @@ dist/
 build/
 coverage/
 
+# JSON storage provider data (DATA_PROVIDER=json)
+/data/
+
 /Build-Docs
 /tests/results
