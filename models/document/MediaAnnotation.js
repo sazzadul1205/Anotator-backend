@@ -98,6 +98,68 @@ class MediaAnnotation {
     return this.collection().countDocuments({ datasetId: oid });
   }
 
+  /**
+   * How many annotations one person created, optionally within a time window.
+   *
+   * This is the durable half of "how much did they do". The ephemeral half —
+   * whether they are online right now — lives in PresenceSession; keeping them
+   * separate means a deleted presence record can never lose real work, and a
+   * forged one cannot inflate the count.
+   */
+  static async countByUser(userId, from, to) {
+    const oid = stringIds.coerce(userId);
+    if (!oid) return 0;
+    const filter = { createdBy: oid };
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = from;
+      if (to) filter.createdAt.$lte = to;
+    }
+    return this.collection().countDocuments(filter);
+  }
+
+  /** One annotator's most recent annotations, newest first. */
+  static async findRecentByUser(userId, limit = 10) {
+    const oid = stringIds.coerce(userId);
+    if (!oid) return [];
+    const docs = await this.collection().find(
+      { createdBy: oid },
+      { sort: { createdAt: -1 }, limit: Math.min(50, Math.max(1, limit)) },
+    );
+    return docs.map(mediaAnnotationToDTO);
+  }
+
+  /**
+   * Annotation counts per creator within a window — one round trip for the
+   * whole team.
+   *
+   * A per-user `countByUser` loop would be N queries every time the admin board
+   * polls, and the board polls on a short interval by design. Grouping here
+   * keeps that cost flat as the team grows.
+   *
+   * Sorted by userId so both strategies return rows in the same order; ties are
+   * impossible because the grouping key is unique per row group.
+   */
+  static async groupByUser(from, to) {
+    const filter = {};
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = from;
+      if (to) filter.createdAt.$lte = to;
+    }
+    const docs = await this.collection().find(filter, { sort: { createdAt: 1 } });
+
+    const counts = new Map();
+    for (const doc of docs) {
+      if (!doc.createdBy) continue;
+      const key = String(doc.createdBy);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([userId, count]) => ({ userId, count }))
+      .sort((a, b) => (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0));
+  }
+
   /** Distinct label values in a dataset — the class vocabulary actually used. */
   static async distinctLabels(datasetId) {
     const oid = stringIds.coerce(datasetId);

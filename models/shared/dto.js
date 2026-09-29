@@ -294,6 +294,48 @@ function mediaAnnotationVersionToDTO(doc) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Presence
+// ---------------------------------------------------------------------------
+
+/**
+ * A live session, one per browser tab.
+ *
+ * Note what is NOT here: no keystrokes, no mouse coordinates, no per-event log.
+ * This records that a person is present and roughly busy, which is what
+ * "am I being idle right now?" needs, and stops there. `lastAction` is a
+ * coarse label ("annotating asset 7f3a") the client volunteers.
+ *
+ * `status` is absent by design. It is derived from `lastSeenAt` at read time
+ * by the presence service, because a stored status goes stale the moment the
+ * server stops being asked — and the whole feature is detecting exactly that
+ * staleness.
+ */
+function presenceSessionToDTO(doc) {
+  if (!doc) return null;
+  return withIdAlias({
+    id: idStr(doc._id),
+    userId: idStr(doc.userId),
+    sessionKey: doc.sessionKey,
+    lastState: doc.lastState,
+    startedAt: doc.startedAt,
+    lastSeenAt: doc.lastSeenAt,
+    lastActiveAt: doc.lastActiveAt ?? null,
+    activeMs: doc.activeMs || 0,
+    idleMs: doc.idleMs || 0,
+    heartbeats: doc.heartbeats || 0,
+    activeByDate: doc.activeByDate || {},
+    lastAction: doc.lastAction ?? null,
+    lastActionAt: doc.lastActionAt ?? null,
+    lastTargetType: doc.lastTargetType ?? null,
+    lastTargetId: idStr(doc.lastTargetId),
+    userAgent: doc.userAgent ?? null,
+    ip: doc.ip ?? null,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  });
+}
+
 module.exports = {
   commentToDTO,
   userToDTO,
@@ -306,4 +348,5 @@ module.exports = {
   mediaAssetToDTO,
   mediaAnnotationToDTO,
   mediaAnnotationVersionToDTO,
+  presenceSessionToDTO,
 };

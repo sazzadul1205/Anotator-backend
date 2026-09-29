@@ -97,6 +97,36 @@ class Comment {
     return { total, pending, annotated };
   }
 
+  /**
+   * Comments completed per annotator within a window — one round trip for the
+   * whole team, mirroring MediaAnnotation.groupByUser.
+   *
+   * Counts on `annotatedAt`, not `updatedAt`: a comment that was assigned,
+   * reopened and re-annotated is work the person did, and keying on updatedAt
+   * would also credit them for edits that were not their finishing.
+   *
+   * Sorted by userId so both strategies agree row-for-row.
+   */
+  static async groupByAnnotatedBy(from, to) {
+    const filter = {};
+    if (from || to) {
+      filter.annotatedAt = {};
+      if (from) filter.annotatedAt.$gte = from;
+      if (to) filter.annotatedAt.$lte = to;
+    }
+    const docs = await this.collection().find(filter);
+
+    const counts = new Map();
+    for (const doc of docs) {
+      if (!doc.annotatedBy) continue;
+      const key = String(doc.annotatedBy);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([userId, count]) => ({ userId, count }))
+      .sort((a, b) => (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0));
+  }
+
   static async groupByField(datasetId, field) {
     const filter = {};
     if (datasetId) {

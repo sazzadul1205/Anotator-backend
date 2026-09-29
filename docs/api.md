@@ -1081,6 +1081,107 @@ Export annotated comments as a train/val/test split, ready for ML training.
 
 ---
 
+## Presence & Annotator Activity
+
+The `presence` domain tracks who is working *right now*, how long they have
+been working, and how much they have finished. It is deliberately lightweight:
+a heartbeat is the only thing that keeps a session alive, status is derived at
+read time from `lastSeenAt` (never stored), and no keystrokes or per-event logs
+are recorded.
+
+### `POST /presence/heartbeat`
+
+The single endpoint any authenticated user calls. The server defines the
+interval and returns it, so the client never hard-codes the cadence.
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Body:**
+```json
+{
+  "sessionKey": "string (8-64 chars, A-Za-z0-9_-)",
+  "state": "active | idle | away",
+  "action": "optional short label",
+  "targetType": "optional",
+  "targetId": "optional"
+}
+```
+
+**Returns:**
+```json
+{
+  "success": true,
+  "sessionId": "string",
+  "sessionKey": "string",
+  "status": "active | idle | away | offline",
+  "serverTime": "ISO-8601",
+  "heartbeatIntervalMs": 15000,
+  "idleAfterMs": 60000,
+  "offlineAfterMs": 180000
+}
+```
+
+**How active time is counted:** the delta between this heartbeat and the
+previous one is credited to whichever state the *previous* heartbeat claimed
+(`lastState`). The delta is capped at `2 * heartbeatIntervalMs` so a laptop
+that was asleep does not accrue phantom hours.
+
+### `GET /presence/me`
+
+The caller's own presence (used for their header indicator).
+
+**Returns:** `{ success, status, sessions[], activeMsToday }`
+
+### `GET /presence/board` (Admin)
+
+Live team board — one row per user, online first.
+
+**Query:** none  
+**Returns:**
+```json
+{
+  "success": true,
+  "serverTime": "ISO-8601",
+  "today": "YYYY-MM-DD",
+  "totals": { "users": 12, "active": 5, "idle": 3, "away": 1, "offline": 3, "activeMsToday": 123456789, "outputToday": 47 },
+  "thresholds": { "heartbeatIntervalMs": 15000, "idleAfterMs": 60000, "offlineAfterMs": 180000 },
+  "rows": [
+    {
+      "userId": "...",
+      "name": "Asha",
+      "email": "asha@example.com",
+      "role": "annotator",
+      "isActive": true,
+      "status": "active",
+      "sessionCount": 1,
+      "activeMsToday": 10800000,
+      "annotationsToday": 3,
+      "commentsToday": 2,
+      "outputToday": 5,
+      "lastActiveAt": "ISO-8601",
+      "lastAction": "annotating asset 7f3a",
+      "lastActionAt": "ISO-8601",
+      "lastTargetId": "..."
+    }
+  ]
+}
+```
+
+### `GET /presence/users/:userId` (Admin)
+
+One annotator's history — per-day series + recent annotations.
+
+**Query:** `?days=14` (1..90, default 14)  
+**Returns:** `{ user, status, totalActiveMs, sessionCount, days, series[], sessions[], recentAnnotations[] }`
+
+### `POST /presence/sweep` (Admin)
+
+Manual cleanup of sessions older than `PRESENCE_RETENTION_DAYS` (also runs at boot).
+
+**Returns:** `{ success, deletedCount, cutoff }`
+
+---
+
 ## Endpoint Summary
 
 | Group             | Count  |
@@ -1100,4 +1201,5 @@ Export annotated comments as a train/val/test split, ready for ML training.
 | Media · Export    | 1      |
 | Audit Log         | 2      |
 | Analytics         | 3      |
-| **Total**         | **69** |
+| Presence          | 5      |
+| **Total**         | **74** |

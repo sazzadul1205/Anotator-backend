@@ -4,6 +4,7 @@
 const bcrypt = require("bcryptjs");
 const { User, Dataset } = require("../models");
 const { audit } = require("../utils/audit");
+const presenceService = require("./presenceService");
 
 async function listUsers() {
   return User.findAll();
@@ -210,6 +211,9 @@ async function deleteUser(id, actorUserId, actor) {
   }
 
   await User.deleteById(id);
+
+  // A deleted user must not leave live-looking sessions behind.
+  await presenceService.purgeUserSessions(id);
 
   await audit({
     action: "user.delete",

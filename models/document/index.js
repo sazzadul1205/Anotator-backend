@@ -1,5 +1,5 @@
 // models/document/index.js
-// The document strategy: twelve model classes that talk to a store presenting
+// The document strategy: thirteen model classes that talk to a store presenting
 // the MongoDB collection API over string ids.
 //
 // Three providers select this strategy — json, sqlite and mysql — because all
@@ -25,4 +25,6 @@ module.exports = {
   MediaAnnotation: require("./MediaAnnotation"),
   MediaAnnotationVersion: require("./MediaAnnotationVersion"),
   MediaLabelSet: require("./MediaLabelSet"),
+  // Presence: live sessions
+  PresenceSession: require("./PresenceSession"),
 };

@@ -92,6 +92,35 @@ class Comment {
     return { total, pending, annotated };
   }
 
+  /**
+   * Comments completed per annotator within a window — one round trip for the
+   * whole team, mirroring MediaAnnotation.groupByUser.
+   *
+   * Counts on `annotatedAt`, not `updatedAt`: a comment that was assigned,
+   * reopened and re-annotated is work the person did, and keying on updatedAt
+   * would also credit them for edits that were not their finishing.
+   *
+   * Sorted by userId so both strategies agree row-for-row.
+   */
+  static async groupByAnnotatedBy(from, to) {
+    const match = {};
+    if (from || to) {
+      match.annotatedAt = {};
+      if (from) match.annotatedAt.$gte = from;
+      if (to) match.annotatedAt.$lte = to;
+    }
+    const rows = await this.collection()
+      .aggregate([
+        { $match: match },
+        { $group: { _id: "$annotatedBy", count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ])
+      .toArray();
+    return rows
+      .filter((r) => r._id)
+      .map((r) => ({ userId: r._id.toString(), count: r.count }));
+  }
+
   static async groupByField(datasetId, field) {
     const match = {};
     if (datasetId) {

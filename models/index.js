@@ -81,6 +81,7 @@ for (const name of [
   "MediaAnnotation",
   "MediaAnnotationVersion",
   "MediaLabelSet",
+  "PresenceSession",
 ]) {
   Object.defineProperty(module.exports, name, {
     enumerable: true,

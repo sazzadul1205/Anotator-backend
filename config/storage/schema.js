@@ -343,6 +343,73 @@ const COLLECTIONS = {
     ],
   },
 
+  // -------------------------------------------------------------------------
+  // Presence: who is working right now, and for how long
+  // -------------------------------------------------------------------------
+  // One row per browser tab. NOT one row per user: a person annotating on a
+  // laptop while a second tab is left open on another monitor is two sessions,
+  // and conflating them makes the numbers unreadable ("active 14h" because a
+  // forgotten tab kept heartbeating overnight).
+  //
+  // The session is a *liveness* record, not an event log. What an annotator
+  // actually did is read from the domain collections that already record it
+  // (media_annotations.createdBy, comments.annotatedBy) — those are durable and
+  // versioned, and duplicating them here would create a second source of truth
+  // that could disagree with the first.
+
+  presence_sessions: {
+    columns: {
+      id: "id",
+      userId: "ref",
+      // Client-generated, stable per tab, survives a reload. It is the natural
+      // key: a user can legitimately have several open at once, and a reload
+      // must re-attach to the same row rather than starting a new session and
+      // resetting the clock.
+      sessionKey: "str",
+      // What the client last claimed: "active" | "idle" | "away". This is a
+      // *claim*, not the status. The status is derived at read time from
+      // lastSeenAt, so a client that lies, freezes, or dies is overridden
+      // rather than believed.
+      lastState: "str",
+      startedAt: "date",
+      lastSeenAt: "date",
+      // Last heartbeat that claimed "active", for the "working on X since" line.
+      lastActiveAt: "date",
+      // Lifetime totals, kept as scalars so the board can sort on them in the
+      // database instead of summing rows in JavaScript on every poll.
+      activeMs: "int",
+      idleMs: "int",
+      heartbeats: "int",
+      // Active milliseconds per UTC day, as a { "YYYY-MM-DD": ms } map.
+      //
+      // A single scalar cannot answer "hours today" for a session that began
+      // yesterday: crediting it entirely to today reports a 14-hour day after
+      // an overnight tab, and crediting it to neither loses real work. Buckets
+      // are the fix, and the map is bounded by how long one tab can plausibly
+      // live (see PRESENCE_RETENTION_DAYS).
+      activeByDate: "json",
+      // Denormalised from the heartbeat payload so the board can answer "what
+      // is this person doing" without a join. Advisory only — a label, not an
+      // audit record.
+      lastAction: "str",
+      lastActionAt: "date",
+      lastTargetType: "str",
+      lastTargetId: "ref",
+      userAgent: "str",
+      ip: "str",
+      createdAt: "date",
+      updatedAt: "date",
+    },
+    indexes: [
+      // The natural key. `upsert`-like "find by key, else create" depends on
+      // this being the only uniqueness constraint here.
+      { keys: ["userId", "sessionKey"], unique: true },
+      // The board's hot query: sessions seen since the offline cutoff.
+      { keys: ["lastSeenAt"], direction: -1 },
+      { keys: ["userId", "lastSeenAt"], direction: -1 },
+    ],
+  },
+
   media_annotation_versions: {
     // Mirrors comment_versions: every create/update/delete of an annotation
     // appends an immutable snapshot, so annotation history is as auditable as

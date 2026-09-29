@@ -1,5 +1,5 @@
 // models/mongo/index.js
-// The MongoDB strategy: twelve model classes that satisfy the contract in
+// The MongoDB strategy: thirteen model classes that satisfy the contract in
 // models/contract.js.
 //
 // Selected automatically when DATA_PROVIDER=mongo (the default). Requiring
@@ -20,4 +20,6 @@ module.exports = {
   MediaAnnotation: require("./MediaAnnotation"),
   MediaAnnotationVersion: require("./MediaAnnotationVersion"),
   MediaLabelSet: require("./MediaLabelSet"),
+  // Presence: live sessions
+  PresenceSession: require("./PresenceSession"),
 };

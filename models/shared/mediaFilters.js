@@ -23,7 +23,11 @@ const ASSET_FILTERABLE = [
 ];
 
 // Fields a caller may filter an annotation by.
-const ANNOTATION_FILTERABLE = ["kind", "label", "assetId", "frameIndex"];
+//
+// `createdBy` is filterable because the presence/activity board has to answer
+// "how many annotations did this person produce in the last hour" without
+// scanning every annotation in the store.
+const ANNOTATION_FILTERABLE = ["kind", "label", "assetId", "frameIndex", "createdBy"];
 
 /**
  * Builds an asset filter.
@@ -83,7 +87,19 @@ function mediaAnnotationFilter(domain = {}, ids = stringIds) {
   for (const field of ANNOTATION_FILTERABLE) {
     if (domain[field] === undefined) continue;
     if (field === "assetId") continue; // already handled above
+    if (field === "createdBy") {
+      f.createdBy = ids.coerce(domain.createdBy);
+      continue;
+    }
     f[field] = domain[field];
+  }
+
+  // Creation time window. Used by the activity board to bucket a person's
+  // output per day without paging the whole collection into memory.
+  if (domain.createdAtFrom || domain.createdAtTo) {
+    f.createdAt = {};
+    if (domain.createdAtFrom) f.createdAt.$gte = domain.createdAtFrom;
+    if (domain.createdAtTo) f.createdAt.$lte = domain.createdAtTo;
   }
 
   if (domain.labelIn && Array.isArray(domain.labelIn)) {

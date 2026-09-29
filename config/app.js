@@ -160,7 +160,51 @@ const config = {
     auth: int("RATE_LIMIT_AUTH", 0) || null,
   },
 
+  // --- Presence & annotator activity ---------------------------------------
+  // An annotator is "present" only while a browser is heartbeating. That single
+  // rule is what makes idle and stale connections detectable: a tab that is
+  // closed, frozen, backgrounded past the browser's timer throttling, or on a
+  // network that died simply stops sending, and the server ages it out on its
+  // own. No client is trusted to report its own liveness.
+  //
+  // These three values form a ladder and are validated as one in
+  // collectProblems(): heartbeat < idle < offline. A violation is a
+  // configuration bug, not something to paper over with a fallback.
+  presence: {
+    // How often a client is asked to check in. Returned in every heartbeat
+    // response so the interval is server-defined and the client never
+    // hard-codes it. Short, because the whole point is to notice a dropped
+    // connection quickly rather than after a timeout has already passed.
+    heartbeatIntervalMs: int("PRESENCE_HEARTBEAT_MS", 15_000, {
+      min: 5_000,
+      max: 300_000,
+    }),
+    // No heartbeat for this long => idle. Kept well above the heartbeat so a
+    // single slow or coalesced request cannot make a working annotator look
+    // idle.
+    idleAfterMs: int("PRESENCE_IDLE_MS", 60_000, {
+      min: 15_000,
+      max: 1_800_000,
+    }),
+    // No heartbeat for this long => offline, and the session stops counting
+    // towards active time. Chosen to sit above background-tab timer throttling
+    // (browsers clamp `setInterval` to >= 1min, often much worse), so merely
+    // switching tabs does not log somebody out.
+    offlineAfterMs: int("PRESENCE_OFFLINE_MS", 180_000, {
+      min: 60_000,
+      max: 7_200_000,
+    }),
+    // How long closed sessions are kept before the boot sweep removes them.
+    // Bounds the collection, and is also the furthest back the activity
+    // history can be read.
+    retentionDays: int("PRESENCE_RETENTION_DAYS", 30, {
+      min: 1,
+      max: 365,
+    }),
+  },
+
   // --- Media (image / video assets) -----------------------------------------
+
   // The *bytes* of an uploaded image or video are not stored in the database.
   // The database holds metadata and annotation geometry; the file itself lives
   // on the local filesystem under `media.root`, and is served only through an
@@ -255,6 +299,24 @@ function collectProblems(cfg = config) {
   }
   if (cfg.media && cfg.media.imageExtensions.length === 0) {
     problems.push("MEDIA_IMAGE_EXTENSIONS must list at least one extension");
+  }
+
+  // The presence thresholds are only meaningful in order. A ladder that runs
+  // backwards makes every session jump straight to offline, and the symptom
+  // (nobody ever appears online) is nowhere near the cause, so it is checked
+  // explicitly rather than left to be discovered in production.
+  if (cfg.presence) {
+    const { heartbeatIntervalMs, idleAfterMs, offlineAfterMs } = cfg.presence;
+    if (!(heartbeatIntervalMs < idleAfterMs)) {
+      problems.push(
+        `PRESENCE_HEARTBEAT_MS (${heartbeatIntervalMs}) must be less than PRESENCE_IDLE_MS (${idleAfterMs})`,
+      );
+    }
+    if (!(idleAfterMs < offlineAfterMs)) {
+      problems.push(
+        `PRESENCE_IDLE_MS (${idleAfterMs}) must be less than PRESENCE_OFFLINE_MS (${offlineAfterMs})`,
+      );
+    }
   }
 
   return problems;

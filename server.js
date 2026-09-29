@@ -13,6 +13,7 @@ const media = require("./config/media");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const concurrency = require("./config/concurrency");
 const { Dataset } = require("./models");
+const presenceService = require("./services/presenceService");
 
 validateEnv();
 
@@ -96,6 +97,7 @@ app.use("/api/taxonomies", require("./routes/taxonomyRoute"));
 app.use("/api/audit", require("./routes/auditRoute"));
 app.use("/api/analytics", require("./routes/analyticsRoute"));
 app.use("/api/media", require("./routes/mediaRoute"));
+app.use("/api/presence", require("./routes/presenceRoute"));
 
 app.use(notFound);
 app.use(errorHandler);
@@ -126,6 +128,14 @@ async function start() {
   const cleaned = await Dataset.cleanupStaleImports(cutoff);
   if (cleaned.modifiedCount > 0) {
     console.log(`🧹 Marked ${cleaned.modifiedCount} stale imports as failed`);
+  }
+
+  // Sweep presence sessions that aged out while the server was down.
+  const swept = await presenceService.sweepStaleSessions();
+  if (swept.deletedCount > 0) {
+    console.log(
+      `🧹 Swept ${swept.deletedCount} stale presence sessions (older than ${config.presence.retentionDays}d)`,
+    );
   }
 
   server = app.listen(PORT, () => {

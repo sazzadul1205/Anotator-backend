@@ -763,6 +763,15 @@ Full annotated list in [`.env.example`](.env.example).
 | `MEDIA_VIDEO_EXTENSIONS` | `mp4,m4v,mov,webm,mkv,avi` | Accepted video extensions |
 | `MEDIA_MAX_ASSETS_PER_DATASET` | `0` | Asset cap per dataset; `0` disables it |
 
+**Presence & annotator activity** (all optional; the tracking works with the defaults):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PRESENCE_HEARTBEAT_MS` | `15000` | How often a client must check in (ms). Short = faster idle detection, more requests. The server tells the client the value in every heartbeat response. |
+| `PRESENCE_IDLE_MS` | `60000` | No heartbeat for this long => idle. Must be greater than `PRESENCE_HEARTBEAT_MS`. |
+| `PRESENCE_OFFLINE_MS` | `180000` | No heartbeat for this long => offline. Must be greater than `PRESENCE_IDLE_MS`. |
+| `PRESENCE_RETENTION_DAYS` | `30` | How many days of closed sessions to keep before the boot sweep removes them. Bounds the collection and is the furthest back the activity history can reach. |
+
 ## 4.2 All commands
 
 | Command | Does | Needs |
@@ -795,6 +804,7 @@ Full annotated list in [`.env.example`](.env.example).
 | Audit | 2 (admin only) | `routes/auditRoute.js` |
 | Analytics | 3 | `routes/analyticsRoute.js` |
 | Media | 24 | `routes/mediaRoute.js` |
+| Presence | 5 | `routes/presenceRoute.js` |
 
 Per-endpoint detail (method, path, role, body, response) is in
 [`docs/api.md`](docs/api.md).
@@ -832,7 +842,86 @@ releasing the SQLite handle. A 10-second timer forces `exit(1)` if connections d
 not drain. Queued jobs that had not started are lost; their datasets stay
 `pending` and the next boot marks them `failed` via `cleanupStaleImports`.
 
-## 4.5 Troubleshooting
+## 4.5 Presence & annotator activity tracking
+
+The `presence` domain tracks who is annotating *right now*, how long they have
+been working, and how much they have finished — without recording keystrokes,
+mouse positions, or per-event logs. The whole mechanism is a heartbeat:
+
+1. A client proves it is alive by sending `POST /api/presence/heartbeat`
+   every `PRESENCE_HEARTBEAT_MS` (default 15 s). That heartbeat is the ONLY
+   thing that keeps a session "present".
+2. Status is **never stored** — it is derived at read time from `lastSeenAt`.
+   That single choice is what makes idle and stale connections detectable:
+   - A tab that is closed, crashed, suspended, or behind a dead network
+     simply stops heartbeating and ages out on its own — no timeout job,
+     no sweeper, nothing to get out of sync.
+   - A client that *lies* about being active is overridden, because the
+     server-side idle threshold fires regardless of the claim.
+   - After a server restart the answers are still correct, because they are
+     computed from timestamps rather than from in-memory session state.
+
+**What this deliberately does not record:** no keystrokes, no mouse coordinates,
+no per-event history. `lastAction` is a short coarse label the client
+volunteers ("annotating asset 7f3a") and is advisory only. Durably *what
+somebody did* is read from the domain collections that already record it —
+`media_annotations.createdBy` and `comments.annotatedBy` — so there is
+exactly one source of truth for output and a presence record can never
+inflate or lose it.
+
+### API
+
+| Method | Path | Role | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/api/presence/heartbeat` | any authenticated user | Check in; returns the server-defined next interval |
+| `GET` | `/api/presence/me` | any authenticated user | The caller's own live status and active time today |
+| `GET` | `/api/presence/board` | admin | Live team board: status, active time today, output today |
+| `GET` | `/api/presence/users/:userId` | admin | One annotator's history (per-day series, recent annotations) |
+| `POST` | `/api/presence/sweep` | admin | Manual cleanup of stale sessions (also runs at boot) |
+
+### How active time is counted
+
+The interval between two heartbeats is credited to whichever state the
+*previous* heartbeat reported, because that is the last known condition across
+the elapsed time. Crediting it from the incoming state instead would let
+somebody who works for an hour and then idles for an hour log two hours of
+active time.
+
+The credited delta is capped at two heartbeat intervals (`heartbeatIntervalMs *
+2`). Without that cap, a laptop that was closed overnight and reopened in the
+morning would report eight hours of "active" time having done nothing — which
+is the single most important thing this feature must never do.
+
+### What the admin board shows
+
+One row per user, online first. Three numbers per row:
+
+| Column | Meaning |
+| --- | --- |
+| **Status** | `active` / `idle` / `away` / `offline` — derived from `lastSeenAt`, never the client's claim |
+| **Active today (hh:mm)** | Exact sum of today's bucket from every retained session |
+| **Output today** | `media_annotations` created + `comments` finished, today |
+
+The board polls on the same interval as the heartbeat (returned by the
+server), so the view is never more than one interval stale.
+
+### Per-annotator detail
+
+`GET /api/presence/users/:userId?days=14` returns a per-day series of active
+time and output for the last 14 days (configurable up to 90), plus the 15 most
+recent annotations with asset names pre-resolved. Every requested day is
+included, even zeros — a sparse series would let a charting library draw a
+straight line through a day somebody was on holiday, which reads as "worked
+steadily" instead of "absent".
+
+### Cleanup
+
+A boot sweep removes sessions older than `PRESENCE_RETENTION_DAYS` (default
+30). An admin can also trigger it manually with `POST /api/presence/sweep`.
+
+---
+
+## 4.6 Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -880,7 +969,7 @@ concurrency is `2 × MAX_CONCURRENT_IMPORTS`. For a larger deployment, move the
 queue to a real worker system (Redis/BullMQ, SQS) rather than scaling the API
 horizontally.
 
-## 4.7 Further documentation
+## 4.8 Further documentation
 
 | Document | Covers |
 | --- | --- |

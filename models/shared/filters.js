@@ -82,6 +82,17 @@ function commentFilter(domain = {}, ids) {
   if (domain.sentiment) f.sentiment = domain.sentiment;
   if (domain.type) f.type = domain.type;
 
+  // Per-annotator output. `annotatedBy` + a window on `annotatedAt` answers
+  // "how many comments did this person finish today", which is the text half of
+  // the activity board. Both fields are declared in config/storage/schema.js,
+  // so the SQL providers can use these filters rather than throwing.
+  if (domain.annotatedBy) f.annotatedBy = ids.coerce(domain.annotatedBy);
+  if (domain.annotatedAtFrom || domain.annotatedAtTo) {
+    f.annotatedAt = {};
+    if (domain.annotatedAtFrom) f.annotatedAt.$gte = domain.annotatedAtFrom;
+    if (domain.annotatedAtTo) f.annotatedAt.$lte = domain.annotatedAtTo;
+  }
+
   if (domain.assignedTo !== undefined) {
     f.assignedTo = domain.assignedTo === null ? null : ids.coerce(domain.assignedTo);
   }

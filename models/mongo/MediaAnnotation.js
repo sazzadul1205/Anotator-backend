@@ -90,6 +90,70 @@ class MediaAnnotation {
     return this.collection().countDocuments({ datasetId: oid });
   }
 
+  /**
+   * How many annotations one person created, optionally within a time window.
+   *
+   * This is the durable half of "how much did they do". The ephemeral half —
+   * whether they are online right now — lives in PresenceSession; keeping them
+   * separate means a deleted presence record can never lose real work, and a
+   * forged one cannot inflate the count.
+   */
+  static async countByUser(userId, from, to) {
+    const oid = objectIds.coerce(userId);
+    if (!oid) return 0;
+    const filter = { createdBy: oid };
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = from;
+      if (to) filter.createdAt.$lte = to;
+    }
+    return this.collection().countDocuments(filter);
+  }
+
+  /** One annotator's most recent annotations, newest first. */
+  static async findRecentByUser(userId, limit = 10) {
+    const oid = objectIds.coerce(userId);
+    if (!oid) return [];
+    const docs = await this.collection()
+      .find({ createdBy: oid })
+      .sort({ createdAt: -1 })
+      .limit(Math.min(50, Math.max(1, limit)))
+      .toArray();
+    return docs.map(mediaAnnotationToDTO);
+  }
+
+  /**
+   * Annotation counts per creator within a window — one round trip for the
+   * whole team.
+   *
+   * A per-user `countByUser` loop would be N queries every time the admin board
+   * polls, and the board polls on a short interval by design. Grouping in the
+   * database keeps that cost flat as the team grows.
+   *
+   * Sorted by userId so both strategies return rows in the same order; ties are
+   * impossible because the grouping key is unique per row group.
+   */
+  static async groupByUser(from, to) {
+    const match = {};
+    if (from || to) {
+      match.createdAt = {};
+      if (from) match.createdAt.$gte = from;
+      if (to) match.createdAt.$lte = to;
+    }
+    const rows = await this.collection()
+      .aggregate([
+        { $match: match },
+        { $group: { _id: "$createdBy", count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ])
+      .toArray();
+    // Re-shaped rather than returned raw — see the note on key order in
+    // labelHistogram above.
+    return rows
+      .filter((r) => r._id)
+      .map((r) => ({ userId: r._id.toString(), count: r.count }));
+  }
+
   static async distinctLabels(datasetId) {
     const oid = objectIds.coerce(datasetId);
     if (!oid) return [];

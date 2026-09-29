@@ -49,7 +49,7 @@ const { dateKey, bucketByBoundaries } = require(
 
 const contractSuite = new Suite("contract · declared surface");
 
-contractSuite.test("all twelve models are declared", () => {
+contractSuite.test("all thirteen models are declared", () => {
   expect.deep(MODEL_NAMES.slice().sort(), [
     "AuditLog",
     "Comment",
@@ -60,6 +60,7 @@ contractSuite.test("all twelve models are declared", () => {
     "MediaAsset",
     "MediaDataset",
     "MediaLabelSet",
+    "PresenceSession",
     "SystemLock",
     "Taxonomy",
     "User",

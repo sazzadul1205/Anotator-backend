@@ -23,8 +23,8 @@ const CONTRACT = {
     "groupByField",
     "lengthHistogram",
     "findTextsForDuplicates",
-    "findForExport",
     "findManyByIds",
+    "groupByAnnotatedBy",
     // writes
     "create",
     "updateById",
@@ -140,6 +140,9 @@ const CONTRACT = {
     "findAllByAsset",
     "countByAsset",
     "countByDataset",
+    "countByUser",
+    "findRecentByUser",
+    "groupByUser",
     "distinctLabels",
     "labelHistogram",
     "create",
@@ -172,6 +175,15 @@ const CONTRACT = {
     "create",
     "updateById",
     "deleteById",
+  ],
+  PresenceSession: [
+    "findById",
+    "findByKey",
+    "findMany",
+    "create",
+    "updateById",
+    "deleteOlderThan",
+    "deleteByUser",
   ],
 };
 
