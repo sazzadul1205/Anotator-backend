@@ -42,7 +42,7 @@ Rules the folder follows:
 
 | Allowed in a controller | Forbidden in a controller |
 | --- | --- |
-| Reading `req.params`, `req.query`, `req.body`, `req.file`, `req.user` | `require("mongodb")`, `getDB()`, `ObjectId` |
+| Reading `req.params`, `req.query`, `req.body`, `req.file`, `req.user` | `require("mongodb")`, `storage.getStore()`, `ObjectId` |
 | Light shape checks that decide the HTTP status (missing file, empty name, bad version number) | Business rules (status flips, label validation, cascades) |
 | Choosing `res.json` / `res.status(...)` / `res.setHeader` / `res.send` | Filter building or `$operators` |
 | `next(err)` | `try/catch` that swallows or reformats service errors |

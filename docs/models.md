@@ -27,22 +27,30 @@
 
 ## 1. What "model" means here
 
-`models/` is the **only** layer in this project that talks to MongoDB. Each file
-wraps exactly one collection in a class with `static` methods (an "adapter") and
-converts between Mongo documents and the plain objects the rest of the app uses.
+`models/` is the **only** layer in this project that talks to a storage
+provider. It is the "bulwark": everything above it sees one fixed API and
+cannot tell which provider is underneath.
+
+There are currently two implementations of that API — `models/mongo/` and
+`models/json/` — selected by `DATA_PROVIDER`. See
+[`storage.md`](storage.md) for the full architecture. What follows describes
+the API itself, which is identical for both strategies.
 
 Rules the project follows (by convention — nothing enforces them automatically):
 
 1. **Services and controllers never touch the driver.** They do not
-   `require("mongodb")`, do not build `$operators`, do not call `getDB()`, and do
-   not call `collection()` themselves.
+   `require("mongodb")`, do not build `$operators`, do not call
+   `storage.getStore()`, and do not call `collection()` themselves.
 2. **Ids are strings on the outside.** Every model accepts and returns string
    ids (`id`, `datasetId`, `assignedTo`, ...). `ObjectId` instances never leave
-   this folder.
-3. **Driver errors never leak.** The adapters translate Mongo error codes into
+   `models/mongo/`.
+3. **Driver errors never leak.** Each adapter translates its native error into
    the domain errors in `models/errors.js` (see [section 3](#3-domain-errors)).
 4. **Write methods return small summaries**, not raw driver results:
    `{ id }`, `{ matchedCount, modifiedCount }`, `{ deletedCount }`, `{ entries, total }`.
+5. **The surface is machine-checked.** Every method listed in this document is
+   declared in `models/contract.js` and verified when a provider loads, so a
+   method added to one strategy and forgotten in the other fails at boot.
 
 ### The barrel file
 
@@ -52,36 +60,43 @@ Rules the project follows (by convention — nothing enforces them automatically
 const { Comment, CommentVersion, Dataset, User } = require("../models");
 ```
 
+The models are exposed as lazy getters, so the selected strategy is only
+required — and only verified against the contract — the first time a model is
+actually touched.
+
 It also re-exports the error classes under the `errors` key
 (`require("../models").errors`). Models that need an error class import it
 directly instead (`require("./errors")`) to avoid a circular require through the
 barrel.
 
-`models/index.js` requires **all** models at load time. A syntax error or bad
-require in any single model breaks every consumer, so keep this folder clean.
+When a strategy is loaded, `models/index.js` verifies it against
+`models/contract.js`. A syntax error or bad require in any single model breaks
+every consumer, so keep this folder clean.
 
 ---
 
 ## 2. The repeated patterns
 
-Every adapter is built from the same five pieces. Once you understand them, you
-can read any model file quickly.
+Every adapter — in both `models/mongo/` and `models/json/` — is built from the
+same five pieces. Once you understand them, you can read any model file
+quickly.
 
 ### 2.1 `static collection()`
 
 ```js
 class Dataset {
   static collection() {
-    return getDB().collection(COLLECTION); // COLLECTION = "datasets"
+    return storage.getStore().collection(COLLECTION); // COLLECTION = "datasets"
   }
 }
 ```
 
-`getDB()` (from `config/db.js`) returns the connected `Db` handle, and returns
-`null` until `connectDB()` has finished. `server.js` only starts listening after
-that, so in practice the collection is always available — but calling a model
-method from a script that never called `connectDB()` will throw
-`Cannot read properties of null`.
+`storage.getStore()` (from `config/storage/index.js`) returns the connected
+handle for whichever provider is active — a Mongo `Db` or the JSON store — and
+returns `null` until `storage.init()` has finished. `server.js` only starts
+listening after that, so in practice the collection is always available — but
+calling a model method from a script that never called `storage.init()` will
+throw `Cannot read properties of null`.
 
 ### 2.2 DTO mapping (`toDTO`)
 
@@ -373,9 +388,11 @@ dies mid-bootstrap, the lock row stays behind (the service releases it in a
 
 ## 6. Indexes
 
-Created by `ensureIndexes(db)` in `config/indexes.js` on every boot (and by
-`npm run init-indexes`). Creating an existing index is a no-op, so the call is
-safe to repeat.
+Declared once in `config/storage/schema.js` and applied on every boot by
+`ensureSchema()` on the active provider (and by `npm run init-indexes`). On
+MongoDB, creating an existing index is a no-op, so the call is safe to repeat;
+on the JSON provider the unique entries are enforced in code on every write and
+the rest are ignored. See [`storage.md`](storage.md) §5.3.
 
 | Collection | Index | Serves |
 | --- | --- | --- |
@@ -430,11 +447,12 @@ behaviour above. These are observations from the code, not wishes.
    whatever succeeded and returns only those. Duplicate `(datasetId, sourceId)`
    rows are silently dropped — the importer counts them as `skipped`. If you need
    to know *why* a row failed, this method will not tell you.
-6. **Invalid ids do not throw.** Every `toOid` helper returns `null` and the
-   method returns `null`/`0`/`{ deletedCount: 0 }`. Services turn that into a 404.
-   A malformed id from a client is therefore a 404, never a 500.
-7. **Models need a connected database.** `getDB()` is `null` until `connectDB()`
-   resolves; calling a model before that throws a `TypeError`.
+6. **Invalid ids do not throw.** Every id-coercion helper returns `null` and
+   the method returns `null`/`0`/`{ deletedCount: 0 }`. Services turn that into
+   a 404. A malformed id from a client is therefore a 404, never a 500.
+7. **Models need a connected store.** `storage.getStore()` is `null` until
+   `storage.init()` resolves; calling a model before that throws a
+   `TypeError`.
 8. **`CommentVersion` version numbers are not enforced by the database.** Two
    concurrent annotations on the same comment can compute the same
    `version + 1`. The write itself is atomic (`updateById`), the history row may
@@ -443,12 +461,19 @@ behaviour above. These are observations from the code, not wishes.
    returns `{ id }`. Harmless today (`utils/audit.js` ignores the result) but
    inconsistent.
 10. **No transactions anywhere.** Cascades (dataset delete → comments → versions)
-    are three separate round-trips: a crash in the middle leaves orphans.
+     are three separate round-trips: a crash in the middle leaves orphans. This
+     is true on both providers, so switching to JSON does not make it worse.
+11. **Sort order is only as stable as the sort key.** Neither provider
+     guarantees an order for equal keys, and the JSON store's tie-break
+     (insertion order) is not the same as MongoDB's. Code that depends on the
+     order of equal-keyed rows is relying on unspecified behaviour — add a
+     unique tiebreaker to the sort if the order matters.
 
 ---
 
 ## Related documents
 
+- [`storage.md`](storage.md) — provider strategy, the bulwark, and switching between MongoDB and JSON
 - [`services.md`](services.md) — business logic that uses these models
 - [`controllers.md`](controllers.md) — HTTP handlers
 - [`api.md`](api.md) — endpoint reference

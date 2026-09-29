@@ -43,7 +43,7 @@ is not HTTP and not storage:
 Not owned by a service:
 
 - **HTTP**: no `req`/`res`, no status codes, no headers. Controllers do that.
-- **Mongo**: no `ObjectId`, no `$operators`, no `getDB()`. Models do that.
+- **Mongo**: no `ObjectId`, no `$operators`, no `storage.getStore()`. Models do that.
 - **Presentation**: no rendering, no column layout decisions beyond export files.
 
 Every service module exports plain `async function`s (no classes, no state).
@@ -419,7 +419,10 @@ Every string that appears in `audit_log.action`, and where it comes from.
 Checklist that keeps the layering intact:
 
 1. **Need a new query?** Add a method to the relevant model first — no
-   `ObjectId`, no `$operators`, no `getDB()` in the service.
+   `ObjectId`, no `$operators`, no `storage.getStore()` in the service.
+   **Add it to both `models/mongo/` and `models/json/`**, and to the
+   `CONTRACT` map in `models/contract.js`; otherwise the next boot fails with
+   a contract violation.
 2. **Validate** the payload and throw `Error` objects with `status: 400`
    (follow the existing `const err = new Error("..."); err.status = 400; throw err;`
    pattern).

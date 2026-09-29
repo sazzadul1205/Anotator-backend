@@ -1,7 +1,15 @@
 # Annotator Backend — Database Reference
 
-**Engine:** MongoDB (Atlas or local 6+)  
+**Engines:** MongoDB (default) **or** an in-app JSON store — see
+[`storage.md`](storage.md)
+**Selection:** `DATA_PROVIDER` = `mongo` (default) | `json`
 **Database name:** configurable via `DB_NAME` (default `annotator_db`)
+
+The collection and document shapes below are the **logical schema**, shared by
+both providers. This document describes MongoDB's representation of it
+(`_id: ObjectId`, real indexes, aggregation pipelines). The JSON provider
+stores the same documents in files with string ids and enforces the unique
+constraints in code; see [`storage.md`](storage.md) §5.4–5.5.
 
 Every document uses Mongo's native `_id: ObjectId` unless noted.
 
