@@ -41,6 +41,7 @@ const UNIT_SUITES = [
   { name: "sql-store", script: "tests/unit/sql-store.test.js" },
   { name: "config", script: "tests/unit/config.test.js" },
   { name: "contract", script: "tests/unit/contract.test.js" },
+  { name: "media", script: "tests/unit/media.test.js" },
 ];
 
 // Every provider the end-to-end matrix knows about.

@@ -498,6 +498,290 @@ async function runScenario(models) {
   out.clearTaxonomy = await Dataset.clearTaxonomy(datasetA.id);
   out.taxonomyAfterClear = (await Dataset.findById(datasetA.id)).taxonomyId;
 
+  // --- media domain --------------------------------------------------------
+  // The media models are exercised here rather than through the services,
+  // because parity is a statement about what the *providers* agree on. The
+  // services' file handling is covered by the end-to-end API suite, and mixing
+  // it in would make a filesystem failure look like a storage divergence.
+  const { MediaDataset, MediaAsset, MediaAnnotation, MediaAnnotationVersion, MediaLabelSet } = models;
+
+  const labelSet = await MediaLabelSet.create({
+    name: "Road",
+    description: "road scenes",
+    labels: [
+      { value: "car", label: "Car", color: "#ff0000" },
+      { value: "person", label: "Person", color: "#00ff00" },
+    ],
+    isActive: true,
+    createdBy: admin.id,
+  });
+  const labelSetDto = await MediaLabelSet.findById(labelSet.id);
+  out.labelSetCreated = {
+    name: labelSetDto.name,
+    labels: labelSetDto.labels,
+    isActive: labelSetDto.isActive,
+  };
+  out.labelSetIdAliasMatches = labelSetDto._id === labelSetDto.id;
+
+  const mds = await MediaDataset.create({
+    name: "City",
+    mediaKind: "image",
+    labelSetId: labelSet.id,
+    description: "parity",
+    status: "pending",
+    createdBy: admin.id,
+  });
+  // create() returns a summary, not the DTO, so re-read for anything the
+  // client would actually see.
+  out.mediaDatasetCreated = ((d) => ({
+    name: d.name,
+    mediaKind: d.mediaKind,
+    totalAssets: d.totalAssets,
+    totalAnnotations: d.totalAnnotations,
+    annotatedRatio: d.annotatedRatio,
+    status: d.status,
+  }))(await MediaDataset.findById(mds.id));
+
+  try {
+    await MediaDataset.create({ name: "City", mediaKind: "image", createdBy: admin.id });
+    out.mediaDatasetDuplicate = "no-error";
+  } catch (err) {
+    // Duplicate name must surface as the same error class on every provider.
+    out.mediaDatasetDuplicate = err.name;
+  }
+
+  const assetACreated = await MediaAsset.create({
+    datasetId: mds.id,
+    kind: "image",
+    originalFileName: "a.png",
+    extension: "png",
+    mimeType: "image/png",
+    sizeBytes: 1234,
+    checksum: "abc123",
+    width: 800,
+    height: 600,
+    status: "pending",
+    source: "upload",
+    createdBy: admin.id,
+  });
+  const assetA = await MediaAsset.findById(assetACreated.id);
+  const assetB = await MediaAsset.create({
+    datasetId: mds.id,
+    kind: "video",
+    originalFileName: "b.mp4",
+    extension: "mp4",
+    mimeType: "video/mp4",
+    sizeBytes: 99999,
+    checksum: "def456",
+    durationMs: 65000,
+    status: "pending",
+    source: "upload",
+    createdBy: admin.id,
+  });
+
+  // storagePath must never reach the client: it is the one field that would let
+  // a client build filesystem paths, which config/media.js refuses to trust.
+  out.mediaAssetDto = ((a) => ({
+    kind: a.kind,
+    width: a.width,
+    height: a.height,
+    durationMs: a.durationMs,
+    status: a.status,
+    hasStoragePath: "storagePath" in a,
+    fileUrlSuffix: a.fileUrl.endsWith(a.id),
+  }))(assetA);
+
+  // Normalised coordinates are the riskiest value in the whole domain: they are
+  // stored as a SQL `float`, and a wrong type mapping silently round-trips a
+  // number as a string, which every exporter would then write out as garbage.
+  const boxCreated = await MediaAnnotation.create({
+    assetId: assetA.id,
+    datasetId: mds.id,
+    kind: "bbox",
+    label: "car",
+    x: 0.125,
+    y: 0.25,
+    boxWidth: 0.5,
+    boxHeight: 0.375,
+    width: 800,
+    height: 600,
+    note: "n",
+    createdBy: admin.id,
+  });
+  const box = await MediaAnnotation.findById(boxCreated.id);
+  out.mediaBoxRoundTrip = ((a) => ({
+    kind: a.kind,
+    box: a.box,
+    types: [typeof a.box.x, typeof a.box.width],
+    boxPixels: a.boxPixels,
+  }))(box);
+  out.mediaBoxPixelMath = box.boxPixels.x === 100 && box.boxPixels.width === 400;
+
+  const clsCreated = await MediaAnnotation.create({
+    assetId: assetA.id,
+    datasetId: mds.id,
+    kind: "classification",
+    label: "person",
+    width: 800,
+    height: 600,
+    createdBy: admin.id,
+  });
+  const cls = await MediaAnnotation.findById(clsCreated.id);
+  out.mediaClassificationHasNoBox = cls.box === null && cls.boxPixels === null;
+
+  // A video annotation carries a frame position; an image one must not.
+  const frameCreated = await MediaAnnotation.create({
+    assetId: assetB.id,
+    datasetId: mds.id,
+    kind: "bbox",
+    label: "car",
+    x: 0,
+    y: 0,
+    boxWidth: 1,
+    boxHeight: 1,
+    frameIndex: 30,
+    timestampMs: 1000,
+    createdBy: admin.id,
+  });
+  const frame = await MediaAnnotation.findById(frameCreated.id);
+  out.mediaFrame = {
+    frameIndex: frame.frameIndex,
+    timestampMs: frame.timestampMs,
+  };
+
+  // A classification on an image has no frame position at all.
+  out.mediaImageFrameIsNull = frame.frameIndex === 30 && cls.frameIndex === null;
+
+  // --- media filters and aggregates ---------------------------------------
+  out.mediaFindByKind = (await MediaAnnotation.findMany({ datasetId: mds.id, kind: "bbox" })).total;
+  out.mediaFindByLabel = (await MediaAnnotation.findMany({ datasetId: mds.id, label: "person" })).total;
+  out.mediaFindByAsset = (await MediaAnnotation.findAllByAsset(assetA.id)).length;
+  out.mediaCountByAsset = await MediaAnnotation.countByAsset(assetA.id);
+  out.mediaCountByDataset = await MediaAnnotation.countByDataset(mds.id);
+  out.mediaDistinctLabels = (await MediaAnnotation.distinctLabels(mds.id)).sort();
+  out.mediaHistogram = await MediaAnnotation.labelHistogram(mds.id);
+  // Compared as a serialised string, not via the transcript's deepStrictEqual:
+  // that ignores key order, and key order is part of the response contract.
+  // BSON hands projected fields back in its own order, so a histogram can have
+  // the right values and still serialise differently per provider.
+  out.mediaHistogramKeyOrder = JSON.stringify(out.mediaHistogram);
+
+  // An empty list filter must match nothing on every provider — the services
+  // rely on this to degrade safely when every id in a batch was malformed.
+  out.mediaEmptyIn = (await MediaAnnotation.findMany({ labelIn: [] })).total;
+  out.mediaAssetEmptyIn = (await MediaAsset.findMany({ checksumIn: [] })).total;
+
+  // A malformed id must match nothing on every provider too. This is the case
+  // that once diverged: the document adapter stringified `{$in: []}` into the
+  // truthy garbage "[object Object]" (matching nothing) while Mongo dropped the
+  // clause entirely and returned the whole collection.
+  out.mediaMalformedIdIn = (await MediaAnnotation.findMany({ assetId: { $in: [] } })).total;
+  out.mediaAssetMalformedIdIn = (await MediaAsset.findMany({ datasetId: { $in: [] } })).total;
+  out.mediaMalformedScalarId = (await MediaAsset.findMany({ datasetId: { a: 1 } })).total;
+
+  // `null` must match null-or-absent, as Mongo does.
+  out.mediaNullFrameIndex =
+    (await MediaAnnotation.findMany({ datasetId: mds.id, frameIndex: null })).total;
+  out.mediaNeLabel = (await MediaAnnotation.findMany({ datasetId: mds.id, label: { $ne: "car" } })).total;
+
+  out.mediaAssetCountByStatus = await MediaAsset.countByStatus(mds.id);
+  out.mediaAssetCountByKind = await MediaAsset.countByKind(mds.id);
+  // Byte sizes are `int` on SQL: a `long` maps to TEXT and comes back a string.
+  out.mediaSumBytes = await MediaAsset.sumBytes(mds.id);
+  out.mediaSumBytesType = typeof (await MediaAsset.sumBytes(mds.id));
+
+  out.mediaAssetSort = (await MediaAsset.findMany(
+    { datasetId: mds.id }, { sortBy: "sizeBytes", sortDir: -1 },
+  )).assets.map((a) => a.extension);
+  out.mediaAssetPage = ((p) => ({ page: p.page, total: p.total, count: p.assets.length }))(
+    await MediaAsset.findMany({ datasetId: mds.id }, { page: 1, limit: 1 }),
+  );
+  out.mediaFindManyByIds = (await MediaAsset.findManyByIds([assetA.id, assetB.id])).length;
+  out.mediaAssetInvalidId = await MediaAsset.findById("not-an-id");
+
+  // --- media history & counters -------------------------------------------
+  const versions1Created = await MediaAnnotationVersion.create({
+    annotationId: box.id,
+    datasetId: mds.id,
+    assetId: assetA.id,
+    revision: 1,
+    snapshot: { kind: "bbox", label: "car", box: { x: 0.125, y: 0.25, width: 0.5, height: 0.375 } },
+    action: "created",
+    actorId: admin.id,
+  });
+  const versions1 = await MediaAnnotationVersion.findOne({
+    annotationId: box.id, revision: 1,
+  });
+  out.mediaVersionCreated = { revision: versions1.revision, action: versions1.action };
+  out.mediaVersionSummaryHasId = typeof versions1Created.id === "string";
+
+  const updated = await MediaAnnotation.updateById(box.id, { label: "person" });
+  out.mediaUpdateModified = updated.modifiedCount;
+  out.mediaUpdateLabel = (await MediaAnnotation.findById(box.id)).label;
+  out.mediaUpdateRevision = (await MediaAnnotation.findById(box.id)).revision;
+
+  // A no-op update must report zero modifications on every provider: services
+  // branch on modifiedCount to decide whether to append a version.
+  const noop = await MediaAnnotation.updateById(box.id, { label: "person" });
+  out.mediaNoopModified = noop.modifiedCount;
+
+  await MediaAnnotationVersion.create({
+    annotationId: box.id,
+    datasetId: mds.id,
+    assetId: assetA.id,
+    revision: 2,
+    snapshot: { kind: "bbox", label: "person" },
+    action: "updated",
+    actorId: admin.id,
+  });
+  out.mediaHistoryLength = (await MediaAnnotationVersion.findByAnnotationId(box.id)).length;
+  out.mediaHistoryCount = await MediaAnnotationVersion.countByAnnotationId(box.id);
+  out.mediaLatestRevision = (await MediaAnnotationVersion.findLatest(box.id)).revision;
+  out.mediaVersionFindOne =
+    (await MediaAnnotationVersion.findOne({ annotationId: box.id, revision: 1 })).revision;
+  out.mediaVersionMissing = await MediaAnnotationVersion.findOne({
+    annotationId: box.id, revision: 99,
+  });
+  out.mediaSnapshotRoundTrip = (await MediaAnnotationVersion.findLatest(box.id)).snapshot;
+  out.mediaActivity = await MediaAnnotationVersion.activityByDate(new Date(0));
+
+  await MediaAsset.setAnnotationState(assetA.id, 2);
+  out.mediaAssetAfterCount = ((a) => ({ annotationCount: a.annotationCount, status: a.status }))(
+    await MediaAsset.findById(assetA.id),
+  );
+  await MediaAsset.setAnnotationState(assetA.id, 0);
+  out.mediaAssetZeroed = ((a) => ({ annotationCount: a.annotationCount, status: a.status }))(
+    await MediaAsset.findById(assetA.id),
+  );
+
+  await MediaAsset.setAnnotationState(assetA.id, 2);
+  await MediaAsset.setAnnotationState(assetB.id, 1);
+  await MediaDataset.setCounters(mds.id, {
+    totalAssets: 2, annotatedAssets: 2, totalAnnotations: 4, totalBytes: 101233,
+  });
+  out.mediaDatasetCounters = ((d) => ({
+    totalAssets: d.totalAssets,
+    annotatedAssets: d.annotatedAssets,
+    totalAnnotations: d.totalAnnotations,
+    totalBytes: d.totalBytes,
+    totalBytesType: typeof d.totalBytes,
+    annotatedRatio: d.annotatedRatio,
+  }))(await MediaDataset.findById(mds.id));
+
+  // --- media cascades ------------------------------------------------------
+  out.mediaDeleteAnnotationsByAsset = await MediaAnnotation.deleteManyByAsset(assetA.id);
+  out.mediaDeleteAnnotationsByDataset = await MediaAnnotation.deleteManyByDataset(mds.id);
+  out.mediaDeleteAsset = await MediaAsset.deleteById(assetA.id);
+  out.mediaDeleteAssetsByDataset = await MediaAsset.deleteManyByDataset(mds.id);
+  out.mediaDeleteDataset = (await MediaDataset.deleteById(mds.id)).deletedCount;
+  out.mediaAfterCascade = {
+    datasets: (await MediaDataset.findMany({})).total,
+    assets: (await MediaAsset.findMany({})).total,
+    annotations: (await MediaAnnotation.findMany({})).total,
+    versions: (await MediaAnnotationVersion.findByAnnotationId("nonexistent")).length,
+  };  // The label set outlives its dataset: label sets are reusable vocabulary.
+  out.labelSetSurvives = (await MediaLabelSet.findById(labelSet.id)).name;
+
   return out;
 }
 

@@ -102,6 +102,16 @@ function hasBom(buf) {
   return buf && buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
 }
 
+/** A minimal valid PNG header for the given dimensions — enough to probe. */
+function pngBytes(width, height) {
+  const b = Buffer.alloc(24);
+  b.writeUInt32BE(0x89504e47, 0);
+  b.write("IHDR", 12, "ascii");
+  b.writeUInt32BE(width, 16);
+  b.writeUInt32BE(height, 20);
+  return b;
+}
+
 // ---------------------------------------------------------------------------
 // Sample CSV payload
 // ---------------------------------------------------------------------------
@@ -723,8 +733,483 @@ async function main() {
   });
 
   // =========================================================================
+  section("Media domain · label sets");
+  // =========================================================================
+
+  await check("POST /media/label-sets (create)", async () => {
+    const res = await request("POST", "/media/label-sets", {
+      token: ctx.adminToken,
+      body: {
+        name: "Road Signs",
+        description: "signs and markings",
+        labels: [
+          { label: "Stop Sign" },
+          { label: "Traffic Light" },
+        ],
+      },
+    });
+    expectStatus(res, 201);
+    expect(res.data.success === true, "success !== true");
+    const set = res.data.data;
+    expect(set.id, "no id returned");
+    // Slugs are what the exporters use, so they are part of the contract.
+    expect(
+      JSON.stringify(set.labels.map((l) => l.value)) ===
+        JSON.stringify(["stop_sign", "traffic_light"]),
+      `unexpected slugs: ${JSON.stringify(set.labels)}`,
+    );
+    expect(set._id === set.id, "_id alias missing");
+    ctx.labelSetId = set.id;
+  });
+
+  await check("POST /media/label-sets as annotator (should 403)", async () => {
+    const res = await request("POST", "/media/label-sets", {
+      token: ctx.annotatorToken,
+      body: { name: "Nope", labels: [{ label: "x" }] },
+    });
+    expect(res.status === 403, `expected 403, got ${res.status}`);
+  });
+
+  await check("POST /media/label-sets with a duplicate slug (should 400)", async () => {
+    const res = await request("POST", "/media/label-sets", {
+      token: ctx.adminToken,
+      body: { name: "Dupes", labels: [{ label: "Cat" }, { label: "cat" }] },
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  await check("POST /media/label-sets with no labels (should 400)", async () => {
+    const res = await request("POST", "/media/label-sets", {
+      token: ctx.adminToken,
+      body: { name: "Empty", labels: [] },
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  await check("GET /media/label-sets (list)", async () => {
+    const res = await request("GET", "/media/label-sets", { token: ctx.adminToken });
+    expectStatus(res, 200);
+    const list = res.data.data;
+    expect(Array.isArray(list), "label set list is not an array");
+    expect(list.some((s) => s.id === ctx.labelSetId), "created label set missing from list");
+  });
+
+  // =========================================================================
+  section("Media domain · datasets & upload");
+  // =========================================================================
+
+  await check("POST /media/datasets (create)", async () => {
+    ctx.mediaDatasetName = `Media DS ${Date.now()}`;
+    const res = await request("POST", "/media/datasets", {
+      token: ctx.adminToken,
+      body: {
+        name: ctx.mediaDatasetName,
+        mediaKind: "image",
+        labelSetId: ctx.labelSetId,
+        description: "api test",
+      },
+    });
+    expectStatus(res, 201);
+    const ds = res.data.data;
+    expect(ds.id, "no id");
+    expect(ds.status === "active", `unexpected status ${ds.status}`);
+    expect(ds.totalAssets === 0, "new dataset should have no assets");
+    expect(ds.mediaKind === "image", `unexpected mediaKind ${ds.mediaKind}`);
+    expect(ds.labelSetId === ctx.labelSetId, "label set not bound at create time");
+    expect(ds._id === ds.id, "_id alias missing");
+    ctx.mediaDatasetId = ds.id;
+  });
+
+  await check("POST /media/datasets (a duplicate name is allowed)", async () => {
+    // Dataset names are not unique in this API, in the text domain either —
+    // only asset checksums are. Asserted so nobody later assumes otherwise.
+    const res = await request("POST", "/media/datasets", {
+      token: ctx.adminToken,
+      body: { name: ctx.mediaDatasetName, mediaKind: "image" },
+    });
+    expectStatus(res, 201);
+    const dup = await request("DELETE", `/media/datasets/${res.data.data.id}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(dup, 200);
+  });
+  await check("POST /media/datasets as annotator (should 403)", async () => {
+    const res = await request("POST", "/media/datasets", {
+      token: ctx.annotatorToken,
+      body: { name: "Nope", mediaKind: "image" },
+    });
+    expect(res.status === 403, `expected 403, got ${res.status}`);
+  });
+
+  await check("GET /media/datasets without a token (should 401)", async () => {
+    const res = await request("GET", "/media/datasets");
+    expect(res.status === 401, `expected 401, got ${res.status}`);
+  });
+
+  await check("GET /media/datasets (list)", async () => {
+    const res = await request("GET", "/media/datasets", { token: ctx.adminToken });
+    expectStatus(res, 200);
+    const list = res.data.data.datasets;
+    expect(Array.isArray(list), "dataset list is not an array");
+    expect(list.some((d) => d.id === ctx.mediaDatasetId), "created dataset missing");
+  });
+
+  await check("GET /media/datasets/:id (detail)", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.labelSetId === ctx.labelSetId, "label set not bound");
+  });
+
+  await check("POST /media/datasets/:id/assets (upload two PNGs)", async () => {
+    const fd = new FormData();
+    fd.append("files", new Blob([pngBytes(640, 480)], { type: "image/png" }), "a.png");
+    fd.append("files", new Blob([pngBytes(800, 600)], { type: "image/png" }), "b.png");
+    const res = await request("POST", `/media/datasets/${ctx.mediaDatasetId}/assets`, {
+      token: ctx.adminToken,
+      formData: fd,
+    });
+    expectStatus(res, 201);
+    const { stored, failed } = res.data.data;
+    expect(failed.length === 0, `unexpected rejections: ${JSON.stringify(failed)}`);
+    expect(stored.length === 2, `expected 2 assets, got ${stored.length}`);
+    ctx.mediaAssetA = stored.find((a) => a.originalFileName === "a.png");
+  });
+
+  await check("upload probed image dimensions", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    const a = res.data.data;
+    expect(a.width === 640 && a.height === 480, `bad dimensions ${a.width}x${a.height}`);
+    expect(a.sizeBytes > 0, "size not recorded");
+    expect(!("storagePath" in a), "storagePath must never reach the client");
+    expect(a.fileUrl === `/api/media/assets/${a.id}/file`, "fileUrl is wrong");
+  });
+
+  await check("upload rejected a disallowed extension", async () => {
+    const fd = new FormData();
+    fd.append("files", new Blob([Buffer.from("MZ "), ], { type: "image/png" }), "bad.exe");
+    const res = await request("POST", `/media/datasets/${ctx.mediaDatasetId}/assets`, {
+      token: ctx.adminToken,
+      formData: fd,
+    });
+    expect(res.status === 400, `expected 400 for a .exe upload, got ${res.status}`);
+  });
+
+  await check("duplicate upload rejected, and no orphan file left behind", async () => {
+    const before = await request("GET", `/media/datasets/${ctx.mediaDatasetId}`, {
+      token: ctx.adminToken,
+    });
+    const fd = new FormData();
+    fd.append("files", new Blob([pngBytes(640, 480)], { type: "image/png" }), "a-copy.png");
+    const res = await request("POST", `/media/datasets/${ctx.mediaDatasetId}/assets`, {
+      token: ctx.adminToken,
+      formData: fd,
+    });
+    // 207, not 409: a folder upload is a batch, so one rejected file is a
+    // partial success the client has to be told about rather than a hard fail.
+    expectStatus(res, 207);
+    expect(res.data.data.stored.length === 0, "a duplicate was stored anyway");
+    expect(res.data.data.failed.length === 1, "the duplicate was not reported as failed");
+    const after = await request("GET", `/media/datasets/${ctx.mediaDatasetId}`, {
+      token: ctx.adminToken,
+    });
+    expect(
+      after.data.data.totalAssets === before.data.data.totalAssets,
+      "a rejected duplicate still created an asset row",
+    );
+  });
+
+  // =========================================================================
+  section("Media domain · file streaming");
+  // =========================================================================
+
+  await check("GET /media/assets/:id/file (full body)", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}/file`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(Buffer.isBuffer(res.data), "file response is not binary");
+    expect(res.data.length > 0, "empty file body");
+  });
+
+  await check("GET file without a token (should 401)", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}/file`);
+    expect(res.status === 401, `expected 401, got ${res.status}`);
+  });
+
+  await check("GET file with a Range header (206 partial content)", async () => {
+    const res = await fetch(`${BASE_URL}/media/assets/${ctx.mediaAssetA.id}/file`, {
+      headers: { Authorization: `Bearer ${ctx.adminToken}`, Range: "bytes=0-15" },
+    });
+    expect(res.status === 206, `expected 206, got ${res.status}`);
+    expect(
+      (res.headers.get("content-range") || "").startsWith("bytes 0-15/"),
+      `bad content-range: ${res.headers.get("content-range")}`,
+    );
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.length === 16, `expected 16 bytes, got ${body.length}`);
+    expect(body.equals(pngBytes(640, 480).subarray(0, 16)), "range bytes do not match the file");
+  });
+
+  await check("GET file with an unsatisfiable Range (416)", async () => {
+    const res = await fetch(`${BASE_URL}/media/assets/${ctx.mediaAssetA.id}/file`, {
+      headers: { Authorization: `Bearer ${ctx.adminToken}`, Range: "bytes=99999999-" },
+    });
+    expect(res.status === 416, `expected 416, got ${res.status}`);
+  });
+
+  await check("GET file for an unknown asset (should 404)", async () => {
+    const res = await request("GET", "/media/assets/000000000000000000000000/file", {
+      token: ctx.adminToken,
+    });
+    expect(res.status === 404, `expected 404, got ${res.status}`);
+  });
+
+  // The 410 path (a row whose bytes are gone from disk) is not reachable
+  // through the API, so it is not asserted here; config/media.js's `exists`
+  // behaviour is covered by the unit suite.
+
+  // =========================================================================
+  section("Media domain · annotations");
+  // =========================================================================
+
+  await check("POST /media/assets/:id/annotations (bbox)", async () => {
+    const res = await request("POST", `/media/assets/${ctx.mediaAssetA.id}/annotations`, {
+      token: ctx.adminToken,
+      body: {
+        kind: "bbox",
+        label: "stop_sign",
+        box: { x: 0.1, y: 0.2, width: 0.3, height: 0.4 },
+      },
+    });
+    expectStatus(res, 201);
+    const a = res.data.data;
+    expect(a.box.x === 0.1, "box not stored normalised");
+    expect(a.boxPixels, "boxPixels not derived");
+    // 0.1 * 640 = 64, 0.2 * 480 = 96.
+    expect(a.boxPixels.x === 64 && a.boxPixels.y === 96, `bad pixel box ${JSON.stringify(a.boxPixels)}`);
+    expect(a._id === a.id, "_id alias missing");
+    ctx.mediaAnnotationId = a.id;
+  });
+
+  await check("POST annotation with a label outside the label set (should 400)", async () => {
+    const res = await request("POST", `/media/assets/${ctx.mediaAssetA.id}/annotations`, {
+      token: ctx.adminToken,
+      body: { kind: "bbox", label: "not_in_set", box: { x: 0, y: 0, width: 0.5, height: 0.5 } },
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  await check("POST annotation with a zero-area box (should 400)", async () => {
+    const res = await request("POST", `/media/assets/${ctx.mediaAssetA.id}/annotations`, {
+      token: ctx.adminToken,
+      body: { kind: "bbox", label: "stop_sign", box: { x: 0, y: 0, width: 0, height: 0.5 } },
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  await check("POST annotation (classification)", async () => {
+    const res = await request("POST", `/media/assets/${ctx.mediaAssetA.id}/annotations`, {
+      token: ctx.adminToken,
+      body: { kind: "classification", label: "traffic_light" },
+    });
+    expectStatus(res, 201);
+    expect(res.data.data.box === null, "a classification must not have a box");
+  });
+
+  await check("GET /media/assets/:id/annotations (list)", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}/annotations`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(Array.isArray(res.data.data), "annotation list is not an array");
+    expect(res.data.data.length === 2, `expected 2 annotations, got ${res.data.data.length}`);
+  });
+
+  await check("asset status became annotated once it had annotations", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.annotationCount === 2, "wrong annotation count");
+    expect(res.data.data.status === "annotated", `status is ${res.data.data.status}`);
+  });
+
+  await check("PATCH /media/annotations/:id (update bumps the revision)", async () => {
+    const res = await request("PATCH", `/media/annotations/${ctx.mediaAnnotationId}`, {
+      token: ctx.adminToken,
+      body: { label: "traffic_light" },
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.revision === 2, `expected revision 2, got ${res.data.data.revision}`);
+  });
+
+  await check("GET /media/annotations/:id/history (create + update)", async () => {
+    const res = await request("GET", `/media/annotations/${ctx.mediaAnnotationId}/history`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(Array.isArray(res.data.data), "history is not an array");
+    expect(res.data.data.length === 2, `expected 2 history entries, got ${res.data.data.length}`);
+  });
+
+  await check("POST restore on a live annotation (should 400)", async () => {
+    // Restore undoes a *delete*. Reverting a live annotation is what PATCH is
+    // for, and silently re-creating the row would fork the history.
+    const res = await request("POST", `/media/annotations/${ctx.mediaAnnotationId}/restore`, {
+      token: ctx.adminToken,
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  await check("DELETE /media/annotations/:id", async () => {
+    const res = await request("DELETE", `/media/annotations/${ctx.mediaAnnotationId}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+  });
+
+  await check("the deleted annotation is gone", async () => {
+    const res = await request("PATCH", `/media/annotations/${ctx.mediaAnnotationId}`, {
+      token: ctx.adminToken,
+      body: { label: "stop_sign" },
+    });
+    expect(res.status === 404, `expected 404, got ${res.status}`);
+  });
+
+  await check("the delete was appended to history, not erased", async () => {
+    const res = await request("GET", `/media/annotations/${ctx.mediaAnnotationId}/history`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.length === 3, `expected 3 history entries, got ${res.data.data.length}`);
+    const latest = res.data.data[0];
+    expect(latest.changeType === "delete", `latest change is ${latest.changeType}`);
+  });
+
+  await check("asset count fell back after the delete", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.annotationCount === 1, `count is ${res.data.data.annotationCount}`);
+  });
+
+  await check("POST /media/annotations/:id/restore (appends, does not rewrite)", async () => {
+    const res = await request("POST", `/media/annotations/${ctx.mediaAnnotationId}/restore`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 201);
+    const restored = res.data.data;
+    expect(restored.id !== ctx.mediaAnnotationId, "restore must create a new row");
+    expect(restored.revision === 1, `a restored row starts at revision 1, got ${restored.revision}`);
+    expect(restored.label === "traffic_light", "restore did not bring back the deleted state");
+    ctx.restoredAnnotationId = restored.id;
+  });
+
+  await check("the restored annotation's own history starts fresh", async () => {
+    const res = await request("GET", `/media/annotations/${ctx.restoredAnnotationId}/history`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(res.data.data.length === 1, `expected 1 entry, got ${res.data.data.length}`);
+    expect(res.data.data[0].changeType === "restore", "first entry is not the restore");
+  });
+
+  await check("GET /media/datasets/:id/stats", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}/stats`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    const s = res.data.data;
+    // stats is the annotation/asset breakdown, not a repeat of the dataset row.
+    expect(s.totalBoxes === 1, `expected 1 box, got ${s.totalBoxes}`);
+    expect(
+      s.byStatus.annotated === 1 && s.byStatus.pending === 1,
+      `unexpected byStatus ${JSON.stringify(s.byStatus)}`,
+    );
+    // The histogram counts boxes only, so the classification is not in it.
+    expect(
+      JSON.stringify(s.labelHistogram) === JSON.stringify([{ label: "traffic_light", count: 1 }]),
+      `unexpected histogram ${JSON.stringify(s.labelHistogram)}`,
+    );
+  });
+
+  await check("GET /media/datasets/:id/annotations", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}/annotations`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    expect(Array.isArray(res.data.data.annotations), "not a paged annotation list");
+    expect(res.data.data.total === 2, `expected 2 annotations, got ${res.data.data.total}`);
+  });
+
+  // =========================================================================
+  section("Media domain · exports");
+  // =========================================================================
+
+  await check("GET /media/datasets/:id/export?format=coco", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}/export?format=coco`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    const c = res.data;
+    expect(Array.isArray(c.images), "coco.images missing");
+    expect(Array.isArray(c.annotations), "coco.annotations missing");
+    expect(c.categories.length === 2, `expected 2 categories, got ${c.categories.length}`);
+    const ann = c.annotations[0];
+    expect(ann.bbox.length === 4, "coco bbox is not [x,y,w,h]");
+    // COCO wants absolute pixels, not the normalised form.
+    expect(ann.bbox[0] > 1, "coco bbox looks normalised");
+    expect(Math.abs(ann.area - ann.bbox[2] * ann.bbox[3]) < 2, "coco area does not match bbox");
+  });
+
+  await check("GET export with an unknown format (should 400)", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}/export?format=parquet`, {
+      token: ctx.adminToken,
+    });
+    expect(res.status === 400, `expected 400, got ${res.status}`);
+  });
+
+  // =========================================================================
   section("Cleanup");
   // =========================================================================
+
+  await check("DELETE /media/datasets/:id (cascade removes assets and annotations)", async () => {
+    const res = await request("DELETE", `/media/datasets/${ctx.mediaDatasetId}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+    const d = res.data.data;
+    expect(d.deletedCount === 1, `expected the dataset row to be deleted, got ${d.deletedCount}`);
+    expect(d.assets === 2, `expected 2 assets cascaded, got ${d.assets}`);
+    expect(d.annotations === 2, `expected 2 annotations cascaded, got ${d.annotations}`);
+  });
+
+  await check("GET the deleted media dataset (should 404)", async () => {
+    const res = await request("GET", `/media/datasets/${ctx.mediaDatasetId}`, {
+      token: ctx.adminToken,
+    });
+    expect(res.status === 404, `expected 404, got ${res.status}`);
+  });
+
+  await check("GET the deleted asset's file (should 404)", async () => {
+    const res = await request("GET", `/media/assets/${ctx.mediaAssetA.id}/file`, {
+      token: ctx.adminToken,
+    });
+    expect(res.status === 404, `expected 404, got ${res.status}`);
+  });
+
+  await check("DELETE /media/label-sets/:id", async () => {
+    const res = await request("DELETE", `/media/label-sets/${ctx.labelSetId}`, {
+      token: ctx.adminToken,
+    });
+    expectStatus(res, 200);
+  });
 
   await check("DELETE /datasets/:id (duplicate)", async () => {
     const res = await request("DELETE", `/datasets/${ctx.duplicateDatasetId}`, {
